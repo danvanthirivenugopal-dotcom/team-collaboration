@@ -1,0 +1,3 @@
+user_id,user_name,date,correction_type,requested_check_in,requested_check_out,reason,status,created_at,admin_reply,updated_at
+2,Danvanthiri V,2026-06-22,Forgot to scan in,09:00 AM,05:00 PM,Just forgot,Accepted,2026-06-22 19:24:47,Your attendance correction request is accepted.,2026-06-26 19:05:23
+18,Bavanshree,2026-06-26,Forgot to scan in,09:00 AM,05:00 PM,sorry sir i missed my attendance,Not Accepted,,Your attendance correction request is not acceptable.,2026-06-26 19:08:24

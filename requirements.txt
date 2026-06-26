@@ -1,0 +1,9 @@
+streamlit>=1.36
+requests>=2.32
+pandas>=2.2
+opencv-python-headless>=4.8
+pillow>=10.3
+fpdf2>=2.7.0
+numpy
+plotly>=5.22
+altair>=5.3
