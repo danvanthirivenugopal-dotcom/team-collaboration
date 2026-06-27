@@ -8,25 +8,17 @@ from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Depends, Query, Request, BackgroundTasks
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Depends, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from backend import config
 from backend.database.db import get_db, init_db
-from backend.services import (
-    captcha_service,
-    auth_service,
-    audit_service,
-    geofence_service,
-    attendance_service,
-    report_service,
-    pdf_service,
-    webauthn_service
-)
+from backend.services import (captcha_service,auth_service,audit_service,geofence_service,attendance_service,report_service,pdf_service,webauthn_service)
 from backend.face_recognition import yolo_detector, recognizer, mediapipe_pose
 import numpy as np
 import cv2
-import os
+import time
+from fastapi import Request
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")  # Suppress TensorFlow oneDNN messages
 
 # Set up logging
@@ -44,8 +36,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-import time
-from fastapi import Request
+
 
 # Simple in-memory IP-based rate limiter
 RATE_LIMITS: Dict[str, List[float]] = {}
@@ -544,6 +535,7 @@ async def update_user_profile(
             bbox, _ = pose_result
             
         # Validate face quality
+        # Validate face quality
         is_valid, err_msg = recognizer.check_face_quality(
             img,
             bbox=bbox,
@@ -552,13 +544,13 @@ async def update_user_profile(
         )
         if not is_valid:
             raise HTTPException(status_code=400, detail=err_msg)
-        
-        # Spoof object detection: phone, laptop, screen, printed material
+
+        # SPOOF FIX 1: detect phone, screen, laptop, printed material
         spoof_object_ok, spoof_object_msg = yolo_detector.detect_spoof_objects(img)
         if not spoof_object_ok:
             raise HTTPException(status_code=400, detail=spoof_object_msg)
 
-        # Image-based spoof detection: flat photo, screen glare, reflection, weak depth
+        # SPOOF FIX 2: detect flat image, glare, weak texture/depth
         spoof_ok, spoof_msg = recognizer.analyze_spoof_risk(img, bbox)
         if not spoof_ok:
             raise HTTPException(status_code=400, detail=spoof_msg)
@@ -590,28 +582,28 @@ async def update_user_profile(
             counter += 1
             
         # Save new image to disk
-        try:
-            with open(profile_path, "wb") as f:
-                f.write(image_bytes)
-            new_profile_path = profile_path.name
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to save profile image: {e}")
-            
-        # Cache new face embedding
+        # PRIVACY FIX: do not permanently store raw face profile image
+        new_profile_path = None
+
+        # Store only temporary pose image for embedding generation
         user_enroll_dir = config.UPLOAD_DIR / "enrollments" / str(user_id)
         user_enroll_dir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(user_enroll_dir / "pose_front.jpg"), img)
-        
+
+        temp_pose_path = user_enroll_dir / "pose_front.jpg"
+        cv2.imwrite(str(temp_pose_path), img)
+
         try:
             recognizer.train_recognizer()
         except Exception as e:
             logger.error(f"Failed to regenerate face embeddings: {e}")
+            raise HTTPException(status_code=500, detail="Failed to generate face embedding.")
         finally:
-            # Delete temporary front pose
+            # Always delete raw temporary face image
             try:
-                os.remove(user_enroll_dir / "pose_front.jpg")
-            except Exception:
-                pass
+                if temp_pose_path.exists():
+                    os.remove(temp_pose_path)
+            except Exception as e:
+                logger.error(f"Failed to delete temporary face image: {e}")
                 
     # Update DB fields
     with get_db() as conn:
@@ -728,6 +720,7 @@ def complete_enrollment(user_id: int = Form(...)):
     required_poses = ["front", "left", "right", "up", "down"]
     
     pose_sizes = []
+    pose_images = []
 
     for pose in required_poses:
         pose_path = user_enroll_dir / f"pose_{pose}.jpg"
@@ -744,9 +737,16 @@ def complete_enrollment(user_id: int = Form(...)):
 
         bbox, keypoints, detection_confidence = face_result
         x, y, w, h = bbox
-        pose_sizes.append(w * h)
 
-    # Depth / live movement consistency check
+        pose_sizes.append(w * h)
+        pose_images.append(pose_img)
+
+    # Strong liveness check using all 5 pose frames
+    live_ok, live_msg = recognizer.verify_liveness_from_poses(pose_images)
+    if not live_ok:
+        raise HTTPException(status_code=400, detail=live_msg)
+
+    # Extra depth consistency check
     if len(pose_sizes) >= 5:
         max_size = max(pose_sizes)
         min_size = min(pose_sizes)
@@ -759,7 +759,7 @@ def complete_enrollment(user_id: int = Form(...)):
         if variation < 1.05:
             raise HTTPException(
                 status_code=400,
-                detail="Weak live movement detected. Please perform real head movement, not a static photo."
+                detail="Weak depth movement detected. Please move your head naturally."
             )
             
     # Duplicate face prevention using embedding similarity
@@ -774,7 +774,7 @@ def complete_enrollment(user_id: int = Form(...)):
     if new_embedding is None:
         raise HTTPException(status_code=400, detail="Could not extract face embedding. Please retake the front photo.")
 
-    DUPLICATE_FACE_THRESHOLD = 0.82
+    DUPLICATE_FACE_THRESHOLD = 0.88
 
     try:
         with get_db() as conn:
@@ -1080,8 +1080,21 @@ async def scan_face(
         
         # Check similarity threshold
         if user_id == -1 or similarity < config.COSINE_SIMILARITY_THRESHOLD:
-            results.append({"status": "unknown", "bbox": bbox})
-            continue
+            # Fallback: try dominant-face recognizer before saying unknown
+            fallback_match = recognizer.predict_face(img)
+
+            if fallback_match:
+                fallback_user_id, fallback_similarity = fallback_match
+
+                if fallback_similarity >= config.COSINE_SIMILARITY_THRESHOLD:
+                    user_id = fallback_user_id
+                    similarity = fallback_similarity
+                else:
+                    results.append({"status": "unknown", "bbox": bbox})
+                    continue
+            else:
+                results.append({"status": "unknown", "bbox": bbox})
+                continue
             
         # Fetch user details
         with get_db() as conn:
@@ -1096,7 +1109,7 @@ async def scan_face(
             results.append({"status": "unknown", "bbox": bbox})
             continue
             
-        if user["approval_status"] != "Approved":
+        if str(user["approval_status"]).strip().lower() != "approved":
             results.append({
                 "status": "not_approved",
                 "message": "Your registration is waiting for Admin Approval.",
@@ -1148,9 +1161,10 @@ async def scan_face(
                         # uploads/enrollments/<id>/pose_*.jpg, so camera recognition stayed weak/unknown.
                         enrollment_dir = config.UPLOAD_DIR / "enrollments" / str(user["id"])
                         enrollment_dir.mkdir(parents=True, exist_ok=True)
-                        cv2.imwrite(str(enrollment_dir / "pose_front.jpg"), face_crop)
-                        
-                        background_tasks.add_task(recognizer.train_lbph)
+                        temp_auto_pose = enrollment_dir / "pose_front.jpg"
+                        cv2.imwrite(str(temp_auto_pose), face_crop)
+
+                        background_tasks.add_task(recognizer.train_recognizer)
                         
                         with get_db() as conn:
                             with conn.cursor() as cursor:
@@ -2016,10 +2030,7 @@ def get_attendance_report_range(start_date_str: str, end_date_str: str, current_
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, name, email, role 
-                FROM users 
-                WHERE approval_status = 'Approved' 
-                ORDER BY name ASC
+                SELECT id, name, email, role FROM users WHERE approval_status = 'Approved' ORDER BY name ASC
                 """
             )
             all_approved_users = cursor.fetchall()
@@ -2411,8 +2422,6 @@ def get_attendance_overview(
     """Retrieve attendance trends (Present/Absent/Late/Half Day), today's splits, recent logs, and top rankings."""
     auth_service.check_role(current_user, ["Admin", "Super_Admin", "Developer"])
 
-    from datetime import timedelta
-
     now = datetime.now()
 
     with get_db() as conn:
@@ -2576,18 +2585,19 @@ def get_attendance_overview(
             # 6. Top 10 attendance rankings this month (all approved users, sorted by pct desc)
             cursor.execute(
                 """
-                SELECT
-                    u.id,
-                    u.name,
-                    u.department,
-                    u.role,
-                    SUM(CASE WHEN a.status IN ('Present', 'Half Day') THEN 1 ELSE 0 END) AS present_days,
-                    SUM(CASE WHEN a.status = 'Late' THEN 1 ELSE 0 END)    AS late_days
-                FROM users u
-                LEFT JOIN attendance a
-                    ON u.id = a.user_id
-                    AND MONTH(a.attendance_date) = MONTH(CURRENT_DATE())
-                    AND YEAR(a.attendance_date)  = YEAR(CURRENT_DATE())
+                select *
+                from (select *
+                      from (SELECT u.id,
+                                   u.name,
+                                   u.department,
+                                   u.role,
+                                   SUM(CASE WHEN a.status IN ('Present', 'Half Day') THEN 1 ELSE 0 END) AS present_days,
+                                   SUM(CASE WHEN a.status = 'Late' THEN 1 ELSE 0 END)                   AS late_days
+                            FROM users u
+                                     LEFT JOIN attendance a
+                                               ON u.id = a.user_id
+                                                   AND MONTH () ua a.attendance_date)) "ua*" = MONTH (CURRENT_DATE ())
+                    AND YEAR (a.attendance_date) = YEAR (CURRENT_DATE ())
                 WHERE u.approval_status = 'Approved'
                 GROUP BY u.id, u.name, u.department, u.role
                 """

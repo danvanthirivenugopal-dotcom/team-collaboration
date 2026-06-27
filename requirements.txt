@@ -7,3 +7,9 @@ fpdf2>=2.7.0
 numpy
 plotly>=5.22
 altair>=5.3
+
+fastapi
+pydantic
+opencv-python
+mediapipe
+ultralytics

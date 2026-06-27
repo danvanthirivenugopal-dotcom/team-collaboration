@@ -1,10 +1,16 @@
 import os
 from pathlib import Path
-from dotenv import load_dotenv
+import logging
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+logger = logging.getLogger(__name__)
 
-load_dotenv(BASE_DIR / ".env")
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ModuleNotFoundError:
+    logger.warning(
+        "python-dotenv is not installed. Environment variables will be loaded from the system environment only."
+    )
 
 DB_HOST = os.getenv("FACEAI_DB_HOST", "127.0.0.1")
 
@@ -17,6 +23,8 @@ DB_USER = os.getenv("FACEAI_DB_USER", "root")
 DB_PASSWORD = os.getenv("FACEAI_DB_PASSWORD", "")
 DB_NAME = os.getenv("FACEAI_DB_NAME", "sbsteqgf_faceai")
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+from pathlib import Path
 UPLOAD_DIR = BASE_DIR / "uploads"
 USERS_DIR = UPLOAD_DIR / "users"
 ADMINS_DIR = UPLOAD_DIR / "admins"
@@ -60,4 +68,4 @@ ALLOWED_ORIGINS = [
 ]
 CAPTCHA_EXPIRE_MINUTES = 3
 
-COSINE_SIMILARITY_THRESHOLD = 0.55
+COSINE_SIMILARITY_THRESHOLD = 0.45

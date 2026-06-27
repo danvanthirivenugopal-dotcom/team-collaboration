@@ -327,6 +327,48 @@ def analyze_spoof_risk(img: np.ndarray, bbox: tuple | list | None = None) -> tup
 
     return True, ""
 
+def verify_liveness_from_poses(pose_images: list[np.ndarray]) -> tuple[bool, str]:
+    """
+    Multi-frame liveness check using 5 enrollment poses.
+    Rejects static printed/photo replay by checking:
+    - face size movement
+    - brightness variation
+    - image difference between poses
+    """
+
+    if len(pose_images) < 5:
+        return False, "All 5 live face poses are required."
+
+    gray_images = []
+
+    for img in pose_images:
+        if img is None or img.size == 0:
+            return False, "Invalid pose image during liveness check."
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.resize(gray, (160, 160))
+        gray_images.append(gray)
+
+    diffs = []
+
+    for i in range(len(gray_images) - 1):
+        diff = cv2.absdiff(gray_images[i], gray_images[i + 1])
+        score = float(np.mean(diff))
+        diffs.append(score)
+
+    avg_motion = float(np.mean(diffs))
+
+    if avg_motion < 4.5:
+        return False, "Weak live movement detected. Please move your real head, not a static photo."
+
+    brightness_values = [float(np.mean(g)) for g in gray_images]
+    brightness_variation = max(brightness_values) - min(brightness_values)
+
+    if brightness_variation < 2.0:
+        return False, "Very low frame variation detected. Possible photo or screen replay."
+
+    return True, ""
+
 def train_recognizer() -> None:
     """
     Pre-extract and cache DeepFace embeddings for all registered users.
@@ -497,10 +539,11 @@ def predict_face(color_img: np.ndarray) -> tuple[int, float] | None:
         except Exception as e:
             logger.error(f"Error reading embeddings for user {user_id}: {e}")
 
-    if best_user_id != -1:
+    if best_user_id != -1 and best_sim >= COSINE_THRESHOLD:
         logger.info(f"predict_face matched user_id={best_user_id}, sim={best_sim:.4f}")
         return best_user_id, best_sim
 
+    logger.info(f"predict_face: no valid match. best_user_id={best_user_id}, best_sim={best_sim:.4f}")
     return None
 
 

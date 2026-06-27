@@ -32,3 +32,20 @@ FaceAI_Attendance_System/
 - **Computer Vision**: OpenCV
 - **Database**: MySQL
 - **Language**: Python 3.x
+
+## Docker Deployment
+
+You can easily deploy both the frontend and backend of the project using Docker.
+
+### Deploy using Docker Compose
+Make sure you have Docker and Docker Compose installed. Run the following command in the project root:
+
+```bash
+docker-compose up -d --build
+```
+This will start both services. The frontend will be available at `http://localhost:8501` and the backend API at `http://localhost:8000`.
+
+### Docker Hub Link
+
+You can find the Docker images published here:
+- **[Docker Hub Repository: danvanthiri](https://hub.docker.com/repositories/danvanthiri)**

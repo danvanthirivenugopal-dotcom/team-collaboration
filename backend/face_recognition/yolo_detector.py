@@ -1,4 +1,6 @@
 import urllib.request
+from typing import Any
+
 import numpy as np
 import cv2
 import logging
@@ -68,7 +70,8 @@ def get_yolo_object_model() -> YOLO:
         load_yolo_models()
     return yolo_object_model
 
-def detect_single_face(img: np.ndarray, conf: float = 0.4) -> tuple[tuple[int, int, int, int], list, float] | None:
+def detect_single_face(img: np.ndarray, conf: float = 0.4) -> tuple[tuple[int, int, int, int] | None, list[
+    Any] | Any, float] | None:
     """
     Detect largest face.
     Returns:
@@ -134,6 +137,7 @@ def classify_pose(keypoints: list) -> str:
     # Extract coordinates
     # Note: On-screen, Left Eye of user is keypoint 0 (right side of screen usually)
     # and Right Eye of user is keypoint 1 (left side of screen)
+    # noinspection PyBroadException
     try:
         le_x, le_y = keypoints[0][:2]
         re_x, re_y = keypoints[1][:2]
