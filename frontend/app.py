@@ -11,7 +11,7 @@ from io import BytesIO
 from pathlib import Path
 import logging
 import os
-from pages.geo_settings import render_geo_settings
+
 from pages.reports import render_reports_page
 from modules.auth import render_login_section, render_register_section, render_face_enrollment_section
 from modules.scanner import render_scanner_section
@@ -54,10 +54,6 @@ def reset_auth_session():
     st.session_state.registration_step = "form"
     st.session_state.captcha_data = None
     st.session_state.cooldowns = {}
-    st.session_state.location_checked = False
-    st.session_state.latitude = None
-    st.session_state.longitude = None
-    st.session_state.location_denied = False
     st.session_state.fingerprint_scanning = False
     st.session_state.fingerprint_verified = False
     st.session_state.attendance_marked = False
@@ -260,17 +256,9 @@ if "user" not in st.session_state:
 if "token" not in st.session_state:
     st.session_state.token = None
 
-# Safe defaults for scanner state, cooldowns, location, and fingerprint verified statuses
+# Safe defaults for scanner state, cooldowns, and fingerprint verified statuses
 if "cooldowns" not in st.session_state:
     st.session_state.cooldowns = {}
-if "location_checked" not in st.session_state:
-    st.session_state.location_checked = False
-if "latitude" not in st.session_state:
-    st.session_state.latitude = None
-if "longitude" not in st.session_state:
-    st.session_state.longitude = None
-if "location_denied" not in st.session_state:
-    st.session_state.location_denied = False
 if "fingerprint_scanning" not in st.session_state:
     st.session_state.fingerprint_scanning = False
 if "fingerprint_verified" not in st.session_state:
@@ -336,121 +324,7 @@ if st.session_state.get("logged_out"):
     st.session_state._need_clear_cookies = True
     st.session_state._need_save_cookies = False
 
-# Background silent Geolocation capture
-if "location_checked" not in st.session_state:
-    st.session_state.location_checked = False
-if "latitude" not in st.session_state:
-    st.session_state.latitude = None
-if "longitude" not in st.session_state:
-    st.session_state.longitude = None
-if "location_denied" not in st.session_state:
-    st.session_state.location_denied = False
 
-if not st.session_state.location_checked:
-    lat_q = st.query_params.get("lat")
-    lon_q = st.query_params.get("lon")
-    if lat_q and lon_q:
-        st.session_state.latitude = float(lat_q)
-        st.session_state.longitude = float(lon_q)
-        st.session_state.location_checked = True
-        st.session_state.location_denied = False
-        st.query_params.clear()
-        st.rerun()
-    else:
-        err_q = st.query_params.get("loc_err")
-        if err_q:
-            st.session_state.latitude = None
-            st.session_state.longitude = None
-            st.session_state.location_denied = True
-            st.session_state.location_checked = True
-            st.query_params.clear()
-            st.rerun()
-        else:
-            # Inject silent geolocation script in the background
-            st.components.v1.html(
-                """
-                <script>
-                const cacheKey = "face_ai_geo_cache";
-                const now = Date.now();
-                let cached = null;
-                try {
-                    cached = JSON.parse(localStorage.getItem(cacheKey));
-                } catch(e) {}
-
-                // Only use cache if it is fresh (2 minutes) and has valid non-zero coords
-                const cacheFresh = cached && (now - cached.timestamp < 120000)
-                    && cached.lat !== 0 && cached.lon !== 0;
-
-                if (cacheFresh) {
-                    try {
-                        const url = new URL(window.parent.location.href);
-                        url.searchParams.set("lat", cached.lat);
-                        url.searchParams.set("lon", cached.lon);
-                        window.parent.location.href = url.href;
-                    } catch(e) {
-                        const parentUrl = document.referrer || window.location.href;
-                        const url = new URL(parentUrl);
-                        url.searchParams.set("lat", cached.lat);
-                        url.searchParams.set("lon", cached.lon);
-                        const a = document.createElement('a');
-                        a.href = url.href;
-                        a.target = '_parent';
-                        document.body.appendChild(a);
-                        a.click();
-                    }
-                } else {
-                    navigator.geolocation.getCurrentPosition(
-                         function(position) {
-                             const lat = position.coords.latitude;
-                             const lon = position.coords.longitude;
-                             try {
-                                 localStorage.setItem(cacheKey, JSON.stringify({
-                                     lat: lat,
-                                     lon: lon,
-                                     timestamp: Date.now()
-                                 }));
-                             } catch(e) {}
-                             try {
-                                 const url = new URL(window.parent.location.href);
-                                 url.searchParams.set("lat", lat);
-                                 url.searchParams.set("lon", lon);
-                                 window.parent.location.href = url.href;
-                             } catch(e) {
-                                 const parentUrl = document.referrer || window.location.href;
-                                 const url = new URL(parentUrl);
-                                 url.searchParams.set("lat", lat);
-                                 url.searchParams.set("lon", lon);
-                                 const a = document.createElement('a');
-                                 a.href = url.href;
-                                 a.target = '_parent';
-                                 document.body.appendChild(a);
-                                 a.click();
-                             }
-                         },
-                         function(error) {
-                             console.error("GPS Error: " + error.message);
-                             try {
-                                 const url = new URL(window.parent.location.href);
-                                 url.searchParams.set("loc_err", "true");
-                                 window.parent.location.href = url.href;
-                             } catch(e) {
-                                 const parentUrl = document.referrer || window.location.href;
-                                 const url = new URL(parentUrl);
-                                 url.searchParams.set("loc_err", "true");
-                                 const a = document.createElement('a');
-                                 a.href = url.href;
-                                 a.target = '_parent';
-                                 document.body.appendChild(a);
-                                 a.click();
-                             }
-                         },
-                        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
-                    );
-                }
-                </script>
-                """,
-                height=1
-            )
 
 # Session Inactivity Timeout (15 minutes = 900 seconds)
 if st.session_state.get("authenticated") and st.session_state.get("user_id"):
@@ -1808,8 +1682,6 @@ else:
         allowed_pages = ["Guest Dashboard", "Logout", "Feature", "Techstack", "Comment", "Team", "Welcome"]
     elif role_key in ["admin", "super_admin", "superadmin"]:
         page_options = ["Dashboard", "Manage Users", "Attendance", "Attendance Log", "Reports", "Profile"]
-        if role_key in ["super_admin", "superadmin"]:
-            page_options.append("Geo Location Settings")
         page_options.append("System Settings")
         allowed_pages = page_options + ["My Account", "Logout", "Admin Dashboard", "User Dashboard", "Feature", "Techstack", "Comment", "Team", "Welcome", "Update Face Profile"]
     elif role_key == "developer":
@@ -1827,7 +1699,7 @@ else:
 protected_nav_pages = [
     "Dashboard", "User Dashboard", "Admin Dashboard", "Manage Users", "Attendance",
     "Attendance Log", "Reports", "Profile", "My Account", "System Settings",
-    "Geo Location Settings", "Update Face Profile", "Guest Dashboard"
+    "Update Face Profile", "Guest Dashboard"
 ]
 
 if st.session_state.current_page in protected_nav_pages and not _is_logged_in():
@@ -1854,7 +1726,7 @@ render_navbar()
 # Enforce authentication for restricted pages
 restricted_pages = [
     "User Dashboard", "Dashboard", "Admin Dashboard", "Manage Users", 
-    "Attendance Log", "System Settings", "Reports", "Geo Location Settings", 
+    "Attendance Log", "System Settings", "Reports", 
     "Profile", "Update Face Profile", "Admin"
 ]
 if st.session_state.current_page in restricted_pages and not _is_logged_in():
@@ -1879,11 +1751,7 @@ elif st.session_state.current_page == "Comment":
     render_comments_section()
 elif st.session_state.current_page == "Team":
     render_team_section()
-elif st.session_state.current_page == "Geo Location Settings":
-    if str(st.session_state.get("user_role", "")).lower() == "super_admin":
-        render_geo_settings()
-    else:
-        st.error("❌ Access Denied: Only Super Admin can access Geo Location Settings.")
+
 elif st.session_state.current_page == "Reports":
     render_reports_page()
 elif st.session_state.current_page in ["Home / Scanner", "Attendance"]:
@@ -2318,11 +2186,7 @@ elif st.session_state.current_page in ["Admin Dashboard", "Dashboard"]:
                     except Exception as e:
                         st.error(f"Failed to save settings: {e}")
                 
-                if str(st.session_state.get("user_role", "")).lower() == "super_admin":
-                    st.write("")
-                    if st.button("📍 Set Geo Location", use_container_width=True, key="btn_nav_geo_settings"):
-                        go_to_page("Geo Location Settings")
-                
+
                 st.markdown("---")
                 st.markdown("#### Current Settings")
                 def to_12h_format(t_str: str) -> str:

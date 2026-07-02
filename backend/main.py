@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from backend import config
 from backend.database.db import get_db, init_db
-from backend.services import (captcha_service,auth_service,audit_service,geofence_service,attendance_service,report_service,pdf_service,webauthn_service)
+from backend.services import (captcha_service,auth_service,audit_service,attendance_service,report_service,pdf_service,webauthn_service)
 from backend.face_recognition import yolo_detector, recognizer, mediapipe_pose
 import numpy as np
 import cv2
@@ -69,13 +69,9 @@ class LoginPayload(BaseModel):
 
 class CheckOutPayload(BaseModel):
     user_id: int
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
 
 class CheckInPayload(BaseModel):
     user_id: int
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
 
 class ScanResultPayload(BaseModel):
     user_id: int
@@ -112,8 +108,6 @@ class WebAuthnAuthPayload(BaseModel):
     authenticator_data: str
     signature: str
     user_handle: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
 
 class WebAuthnChallengeRequest(BaseModel):
     user_id: int
@@ -219,19 +213,7 @@ def startup_event():
     except Exception as e:
         logger.error(f"Startup loading failed: {e}")
 
-@app.get("/attendance/location-status")
-def attendance_location_status():
-    """Public endpoint: whether GPS is required for check-in."""
-    active = geofence_service.get_active_geo_fences()
-    return {
-        "location_required": len(active) > 0,
-        "active_fences": len(active),
-    }
 
-@app.get("/attendance/location-check")
-def attendance_location_check(latitude: Optional[float] = None, longitude: Optional[float] = None):
-    """Public endpoint: check if coordinates are inside configured geofences."""
-    return geofence_service.get_location_details(latitude, longitude)
 
 @app.get("/health")
 def health():
@@ -774,7 +756,7 @@ def complete_enrollment(user_id: int = Form(...)):
     if new_embedding is None:
         raise HTTPException(status_code=400, detail="Could not extract face embedding. Please retake the front photo.")
 
-    DUPLICATE_FACE_THRESHOLD = 0.88
+    DUPLICATE_FACE_THRESHOLD = max(config.COSINE_SIMILARITY_THRESHOLD, 0.40)
 
     try:
         with get_db() as conn:
@@ -1005,9 +987,7 @@ def login(payload: LoginPayload):
 @app.post("/attendance/scan", dependencies=[limit_scan_per_min])
 async def scan_face(
     background_tasks: BackgroundTasks,
-    image: UploadFile = File(...),
-    latitude: Optional[float] = Form(None),
-    longitude: Optional[float] = Form(None)
+    image: UploadFile = File(...)
 ):
     """
     Perform face scanning for attendance check-in.
@@ -1053,6 +1033,15 @@ async def scan_face(
     
     # ===== FACE RECOGNITION =====
     predictions = recognizer.predict_multiple_faces(img)
+
+    # Attendance scanner should process only ONE main face.
+    # This prevents duplicate / multiple face marking from the same camera frame.
+    if len(predictions) > 1:
+        predictions = sorted(
+            predictions,
+            key=lambda p: (p["bbox"][2] - p["bbox"][0]) * (p["bbox"][3] - p["bbox"][1]),
+            reverse=True
+        )[:1]
     
     # Fallback to YOLOv8 single face detection if InsightFace returned nothing
     if not predictions:
@@ -1080,6 +1069,10 @@ async def scan_face(
         
         # Check similarity threshold
         if user_id == -1 or similarity < config.COSINE_SIMILARITY_THRESHOLD:
+            logger.info(
+                f"Low face match. user_id={user_id}, similarity={similarity}, "
+                f"threshold={config.COSINE_SIMILARITY_THRESHOLD}"
+            )
             # Fallback: try dominant-face recognizer before saying unknown
             fallback_match = recognizer.predict_face(img)
 
@@ -1125,9 +1118,7 @@ async def scan_face(
         try:
             res = attendance_service.handle_biometric_attendance(
                 user_id=user["id"],
-                method="face",
-                latitude=latitude,
-                longitude=longitude
+                method="face"
             )
             
             # Map the precise status correctly for the frontend response list
@@ -1209,21 +1200,8 @@ def check_in_endpoint(payload: CheckInPayload):
                 "message": "You have already checked in today."
             }
             
-        # Verify location
-        loc_ok, fence_id, fence_name = geofence_service.verify_location(payload.latitude, payload.longitude)
-        if not loc_ok:
-            if geofence_service.is_location_required() and (payload.latitude is None or payload.longitude is None):
-                detail = "Check-in denied. Location access is required. Please enable GPS and try again."
-            else:
-                detail = "Check-in denied. You are outside the allowed location."
-            raise HTTPException(status_code=400, detail=detail)
-            
         res = attendance_service.mark_check_in(
-            user_id=payload.user_id,
-            latitude=payload.latitude,
-            longitude=payload.longitude,
-            fence_id=fence_id,
-            fence_name=fence_name
+            user_id=payload.user_id
         )
         return {
             "success": True,
@@ -1239,9 +1217,7 @@ def check_out(payload: CheckOutPayload):
     """Record checkout timestamp for today."""
     try:
         res = attendance_service.mark_check_out(
-            user_id=payload.user_id,
-            latitude=payload.latitude,
-            longitude=payload.longitude
+            user_id=payload.user_id
         )
         return {
             "success": True,
@@ -1341,22 +1317,12 @@ def webauthn_authenticate(payload: WebAuthnAuthPayload):
     # Step 2: Run unified biometric attendance engine
     att_result = attendance_service.handle_biometric_attendance(
         user_id=user_id,
-        method="fingerprint",
-        latitude=payload.latitude,
-        longitude=payload.longitude,
+        method="fingerprint"
     )
 
     status = att_result["status"]
 
-    if status == "location_error":
-        return {
-            "success": False,
-            "status": "location_violation",
-            "message": att_result["message"],
-            "user_id": user_id,
-            "user_name": user_name,
-        }
-    elif status == "checked_in":
+    if status == "checked_in":
         return {
             "success": True,
             "status": "checked_in",
@@ -2585,19 +2551,17 @@ def get_attendance_overview(
             # 6. Top 10 attendance rankings this month (all approved users, sorted by pct desc)
             cursor.execute(
                 """
-                select *
-                from (select *
-                      from (SELECT u.id,
-                                   u.name,
-                                   u.department,
-                                   u.role,
-                                   SUM(CASE WHEN a.status IN ('Present', 'Half Day') THEN 1 ELSE 0 END) AS present_days,
-                                   SUM(CASE WHEN a.status = 'Late' THEN 1 ELSE 0 END)                   AS late_days
-                            FROM users u
-                                     LEFT JOIN attendance a
-                                               ON u.id = a.user_id
-                                                   AND MONTH () ua a.attendance_date)) "ua*" = MONTH (CURRENT_DATE ())
-                    AND YEAR (a.attendance_date) = YEAR (CURRENT_DATE ())
+                SELECT u.id,
+                       u.name,
+                       u.department,
+                       u.role,
+                       SUM(CASE WHEN a.status IN ('Present', 'Half Day') THEN 1 ELSE 0 END) AS present_days,
+                       SUM(CASE WHEN a.status = 'Late' THEN 1 ELSE 0 END)                   AS late_days
+                FROM users u
+                         LEFT JOIN attendance a
+                                   ON u.id = a.user_id
+                                       AND MONTH(a.attendance_date) = MONTH(CURRENT_DATE())
+                                       AND YEAR(a.attendance_date) = YEAR(CURRENT_DATE())
                 WHERE u.approval_status = 'Approved'
                 GROUP BY u.id, u.name, u.department, u.role
                 """
@@ -2928,85 +2892,6 @@ def delete_comment(
     return {"status": "ok", "message": "Comment deleted."}
 
 
-# ─── ENTERPRISE GEOFENCE MANAGEMENT ENDPOINTS ──────────────────────────────────
-
-class GeoFencePayload(BaseModel):
-    location_name: str
-    latitude: float
-    longitude: float
-    radius_meters: float
-    is_active: bool = True
-
-@app.get("/admin/geofences")
-def get_geofences(current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)):
-    """Fetch all configured geofences. Super admin only."""
-    auth_service.check_role(current_user, ["Super_Admin"])
-    return geofence_service.list_all_geo_fences()
-
-@app.post("/admin/geofences")
-def create_geofence(
-    payload: GeoFencePayload,
-    current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)
-):
-    """Add a new geo fence. Super admin only."""
-    auth_service.check_role(current_user, ["Super_Admin"])
-    fence_id = geofence_service.add_geo_fence(
-        payload.location_name,
-        payload.latitude,
-        payload.longitude,
-        payload.radius_meters,
-        payload.is_active
-    )
-    if not fence_id:
-        raise HTTPException(status_code=500, detail="Failed to create geofence.")
-        
-    audit_service.log_audit_action(
-        current_user["user_id"], 
-        f"Created Geo Fence: {payload.location_name} (radius: {payload.radius_meters}m)"
-    )
-    return {"status": "ok", "id": fence_id, "message": "Geofence created successfully."}
-
-@app.put("/admin/geofences/{fence_id}")
-def update_geofence(
-    fence_id: int,
-    payload: GeoFencePayload,
-    current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)
-):
-    """Edit an existing geo fence. Super admin only."""
-    auth_service.check_role(current_user, ["Super_Admin"])
-    success = geofence_service.update_geo_fence(
-        fence_id,
-        payload.location_name,
-        payload.latitude,
-        payload.longitude,
-        payload.radius_meters,
-        payload.is_active
-    )
-    if not success:
-        raise HTTPException(status_code=404, detail="Geofence not found or not modified.")
-        
-    audit_service.log_audit_action(
-        current_user["user_id"], 
-        f"Updated Geo Fence ID {fence_id}: {payload.location_name}"
-    )
-    return {"status": "ok", "message": "Geofence updated successfully."}
-
-@app.delete("/admin/geofences/{fence_id}")
-def delete_geofence(
-    fence_id: int,
-    current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)
-):
-    """Delete a geo fence. Super admin only."""
-    auth_service.check_role(current_user, ["Super_Admin"])
-    success = geofence_service.delete_geo_fence(fence_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Geofence not found.")
-        
-    audit_service.log_audit_action(
-        current_user["user_id"], 
-        f"Deleted Geo Fence ID {fence_id}"
-    )
-    return {"status": "ok", "message": "Geofence deleted successfully."}
 
 
 # ─── ENTERPRISE REPORTING ENDPOINTS ───────────────────────────────────────────

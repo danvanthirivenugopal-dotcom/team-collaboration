@@ -115,36 +115,9 @@ class FaceAiApiClient:
             return r.json()
         self._handle_error(r, "Failed to complete face enrollment.")
 
-    def get_location_status(self) -> dict:
-        try:
-            r = requests.get(f"{self.base_url}/attendance/location-status", timeout=3)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            pass
-        return {"location_required": False, "active_fences": 0}
-
-    def get_location_check(self, latitude: float = None, longitude: float = None) -> dict:
-        params = {}
-        if latitude is not None:
-            params["latitude"] = latitude
-        if longitude is not None:
-            params["longitude"] = longitude
-        try:
-            r = requests.get(f"{self.base_url}/attendance/location-check", params=params, timeout=3)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            pass
-        return {"ok": False, "message": "Could not verify location."}
-
-    def scan_attendance_face(self, image_bytes: bytes, latitude: float = None, longitude: float = None) -> dict:
+    def scan_attendance_face(self, image_bytes: bytes) -> dict:
         files = {"image": ("scan.jpg", image_bytes, "image/jpeg")}
         data = {}
-        if latitude is not None:
-            data["latitude"] = str(latitude)
-        if longitude is not None:
-            data["longitude"] = str(longitude)
         try:
             r = requests.post(
                 f"{self.base_url}/attendance/scan",
@@ -159,12 +132,8 @@ class FaceAiApiClient:
             return r.json()
         self._handle_error(r, "Scan failed.")
 
-    def check_out(self, user_id: int, latitude: float = None, longitude: float = None) -> dict:
+    def check_out(self, user_id: int) -> dict:
         payload = {"user_id": user_id}
-        if latitude is not None:
-            payload["latitude"] = latitude
-        if longitude is not None:
-            payload["longitude"] = longitude
         r = requests.post(f"{self.base_url}/attendance/check-out", json=payload)
         if r.status_code == 200:
             return r.json()
@@ -188,12 +157,8 @@ class FaceAiApiClient:
             return r.json()
         raise Exception("Failed to fetch today's attendance.")
 
-    def check_in(self, user_id: int, latitude: float = None, longitude: float = None) -> dict:
+    def check_in(self, user_id: int) -> dict:
         payload = {"user_id": user_id}
-        if latitude is not None:
-            payload["latitude"] = latitude
-        if longitude is not None:
-            payload["longitude"] = longitude
         r = requests.post(f"{self.base_url}/attendance/check-in", json=payload)
         if r.status_code == 200:
             return r.json()
@@ -472,45 +437,6 @@ class FaceAiApiClient:
             return r.json()
         raise Exception("Failed to fetch public stats metrics.")
 
-    # --- GEOFENCES ---
-    def get_geofences(self) -> list:
-        r = requests.get(f"{self.base_url}/admin/geofences", headers=self._get_headers())
-        if r.status_code == 200:
-            return r.json()
-        raise Exception("Failed to fetch geofences.")
-
-    def create_geofence(self, name: str, lat: float, lon: float, radius: float, is_active: bool) -> dict:
-        payload = {
-            "location_name": name,
-            "latitude": lat,
-            "longitude": lon,
-            "radius_meters": radius,
-            "is_active": is_active
-        }
-        r = requests.post(f"{self.base_url}/admin/geofences", json=payload, headers=self._get_headers())
-        if r.status_code == 200:
-            return r.json()
-        self._handle_error(r, "Failed to create geofence.")
-
-    def update_geofence(self, fence_id: int, name: str, lat: float, lon: float, radius: float, is_active: bool) -> dict:
-        payload = {
-            "location_name": name,
-            "latitude": lat,
-            "longitude": lon,
-            "radius_meters": radius,
-            "is_active": is_active
-        }
-        r = requests.put(f"{self.base_url}/admin/geofences/{fence_id}", json=payload, headers=self._get_headers())
-        if r.status_code == 200:
-            return r.json()
-        self._handle_error(r, "Failed to update geofence.")
-
-    def delete_geofence(self, fence_id: int) -> dict:
-        r = requests.delete(f"{self.base_url}/admin/geofences/{fence_id}", headers=self._get_headers())
-        if r.status_code == 200:
-            return r.json()
-        self._handle_error(r, "Failed to delete geofence.")
-
     # --- REPORTS ---
   
     def get_reports(self, date_str=None, month_val=None, year_val=None, user_id=None, status_val=None) -> list:
@@ -598,9 +524,7 @@ class FaceAiApiClient:
         client_data_json: str,
         authenticator_data: str,
         signature: str,
-        user_handle: str = None,
-        latitude: float = None,
-        longitude: float = None,
+        user_handle: str = None
     ) -> dict:
         """Submit WebAuthn assertion response and mark fingerprint attendance."""
         payload = {
@@ -611,10 +535,6 @@ class FaceAiApiClient:
         }
         if user_handle:
             payload["user_handle"] = user_handle
-        if latitude is not None:
-            payload["latitude"] = latitude
-        if longitude is not None:
-            payload["longitude"] = longitude
         r = requests.post(f"{self.base_url}/webauthn/authenticate", json=payload)
         if r.status_code == 200:
             return r.json()

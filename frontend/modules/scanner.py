@@ -9,7 +9,7 @@ import streamlit.components.v1 as components
 def draw_face_overlay(frame, x1, y1, x2, y2, name, user_id, status_det):
     # Select color based on status (BGR format)
     if status_det == "recognized" or status_det == "checked_in":
-        box_color = (0, 255, 0)      # Green for checked-in
+        box_color = (255, 255, 0)    # Cyan to match requested design
         status_text = "MARKED"
     elif status_det in ["already_marked", "ask_leave", "ask_checkout", "already_completed"]:
         box_color = (255, 255, 0)    # Cyan for already marked/leaving
@@ -87,6 +87,25 @@ def draw_face_overlay(frame, x1, y1, x2, y2, name, user_id, status_det):
 # Navigation query parameters are handled only in frontend/app.py.
 
 
+def detect_local_faces(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    face_cascade = cv2.CascadeClassifier(cascade_path)
+
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(80, 80)
+    )
+
+    results = []
+    for (x, y, w, h) in faces:
+        results.append([int(x), int(y), int(x + w), int(y + h)])
+
+    return results
+
+
 def render_scanner_section(api):
     if "cooldowns" not in st.session_state:
         st.session_state.cooldowns = {}
@@ -105,19 +124,6 @@ def render_scanner_section(api):
     if "webauthn_key" not in st.session_state:
         st.session_state.webauthn_key = 0
 
-    if "location_status" not in st.session_state:
-        try:
-            st.session_state.location_status = st.session_state.api.get_location_status()
-        except Exception:
-            st.session_state.location_status = {"location_required": False, "active_fences": 0}
-
-    loc_status = st.session_state.get("location_status", {})
-    location_required = loc_status.get("location_required", False)
-    has_location = (
-        st.session_state.get("latitude") is not None
-        and st.session_state.get("longitude") is not None
-    )
-    location_denied = st.session_state.get("location_denied", False)
 
     # Handle a pending WebAuthn result from JS first thing
     fp_user_id_q = st.query_params.get("fp_user_id")
@@ -164,11 +170,6 @@ def render_scanner_section(api):
         elif fp_status_q == "already_completed" and fp_name_q:
             st.session_state.fingerprint_verified = True
             st.session_state.status_message = ("info", "ℹ️ Today's attendance is already completed.")
-            st.query_params.clear()
-            st.rerun()
-        elif fp_status_q == "location_violation":
-            fp_loc_msg = st.query_params.get("fp_loc_msg", "You are not in the allowed location.")
-            st.session_state.status_message = ("error", f"❌ {fp_loc_msg}")
             st.query_params.clear()
             st.rerun()
         elif fp_status_q == "method_mismatch" and fp_name_q:
@@ -300,24 +301,27 @@ def render_scanner_section(api):
                     st.session_state.pending_attendance_method = "face"
                     st.session_state.scanned_user = None
                     st.session_state.pending_checkout_warning = None
+                    if "cooldowns" not in st.session_state:
+                        st.session_state.cooldowns = {}
+                    st.session_state.cooldowns[user_id] = time.time()
+                    st.session_state.cooldowns[f"ask_{user_id}"] = time.time()
+                    st.session_state.scanning = True
                     st.rerun()
             with c_leave:
                 st.markdown("<style>div[class*='st-key-btn_confirm_checkout'] button { background-color: #EF4444 !important; color: white !important; border-color: #EF4444 !important; font-weight: bold !important; }</style>", unsafe_allow_html=True)
                 if st.button("Leave", type="primary", key="btn_confirm_checkout", use_container_width=True):
                     try:
+                        res = api.check_out(user_id=user_id)
+                        if res and res.get("status") == "ok":
+                            st.session_state.status_message = ("success", f"✅ Check-Out successful! Have a great day.")
+                        else:
+                            st.session_state.status_message = ("error", f"❌ Failed to mark check-out for {user_name}")
                         # Stop scanning during checkout API call
                         st.session_state.scanning = False
                         if "camera" in st.session_state and st.session_state.camera is not None:
                             st.session_state.camera.release()
                             st.session_state.camera = None
                         
-                        res = api.check_out(
-                            user_id=user_id,
-                            latitude=st.session_state.get("latitude"),
-                            longitude=st.session_state.get("longitude")
-                        )
-                        # Set status message to show on next rerun, and clear leave confirmation states
-                        st.session_state.status_message = ("success", f"👋 {user_name} checkout time marked successfully.")
                         st.session_state.show_leave_confirmation = False
                         st.session_state.pending_checkout_user_id = None
                         st.session_state.pending_checkout_user_name = ""
@@ -325,6 +329,11 @@ def render_scanner_section(api):
                         st.session_state.pending_attendance_method = "face"
                         st.session_state.scanned_user = None
                         st.session_state.pending_checkout_warning = None
+                        if "cooldowns" not in st.session_state:
+                            st.session_state.cooldowns = {}
+                        st.session_state.cooldowns[user_id] = time.time()
+                        st.session_state.cooldowns[f"ask_{user_id}"] = time.time()
+                        st.session_state.scanning = True
                         st.rerun()
                     except Exception as e:
                         st.error(f"❌ Checkout failed: {e}")
@@ -365,62 +374,15 @@ def render_scanner_section(api):
             </div>
             """, unsafe_allow_html=True)
 
-            if location_required and not has_location:
-                if location_denied:
-                    st.warning(
-                        "Location access was denied. Please allow location in your browser settings and refresh the page."
-                    )
-                else:
-                    st.info("Waiting for your location... Please allow location access when prompted.")
-            elif has_location:
-                try:
-                    loc_check = st.session_state.api.get_location_check(
-                        st.session_state.latitude,
-                        st.session_state.longitude,
-                    )
-                    if loc_check.get("ok"):
-                        st.success(f"📍 {loc_check.get('message', 'Location verified.')}")
-                    else:
-                        st.warning(f"📍 {loc_check.get('message', 'Location not verified.')}")
-                except Exception:
-                    pass
-
-            col_start, col_retry, col_bypass = st.columns([2, 1, 1])
-            with col_start:
-                st.markdown("<div class='custom-action-btn'>", unsafe_allow_html=True)
-                start_disabled = location_required and not has_location
-                if st.button(
-                    "Start Camera Scanner",
-                    type="primary",
-                    key="btn_start_scanner_custom",
-                    disabled=start_disabled,
-                ):
-                    st.session_state.scanning = True
-                    st.rerun()
-                st.markdown("</div>", unsafe_allow_html=True)
-            with col_retry:
-                if st.button("Retry GPS", key="btn_retry_gps"):
-                    st.session_state.pop("latitude", None)
-                    st.session_state.pop("longitude", None)
-                    st.session_state.pop("location_denied", None)
-                    st.session_state.pop("location_status", None)
-                    st.session_state.pop("location_checked", None)
-                    # Also clear the JS localStorage geo cache so browser re-fetches GPS
-                    components.html(
-                        """<script>
-                        try { localStorage.removeItem('face_ai_geo_cache'); } catch(e) {}
-                        </script>""",
-                        height=1
-                    )
-                    st.rerun()
-            with col_bypass:
-                if location_required and not has_location:
-                    if st.button("Bypass GPS", key="btn_bypass_gps", help="Skip location requirement for testing"):
-                        st.session_state.latitude = 0.0
-                        st.session_state.longitude = 0.0
-                        if "location_status" in st.session_state:
-                            st.session_state.location_status["location_required"] = False
-                        st.rerun()
+            st.markdown("<div class='custom-action-btn'>", unsafe_allow_html=True)
+            if st.button(
+                "Start Camera Scanner",
+                type="primary",
+                key="btn_start_scanner_custom",
+            ):
+                st.session_state.scanning = True
+                st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
 
             # ── Fingerprint Attendance Button ──────────────────────────────────
             st.markdown("<hr style='margin: 1rem 0; border-color: #E5E7EB;'/>", unsafe_allow_html=True)
@@ -439,12 +401,6 @@ def render_scanner_section(api):
             # Inject WebAuthn JS that calls the backend and redirects with result
             # IMPORTANT: st.components.v1.html() must be used (not st.markdown) so <script> executes
             backend_url = getattr(api, "base_url", "http://127.0.0.1:8000")
-            # Use explicit None check — 0.0 is falsy but is a valid coordinate
-            _lat = st.session_state.get("latitude")
-            _lon = st.session_state.get("longitude")
-            lat_val = _lat if _lat is not None else "null"
-            lon_val = _lon if _lon is not None else "null"
-
             scanner_webauthn_html = f"""<!DOCTYPE html>
 <!-- key: {st.session_state.webauthn_key} -->
 <html>
@@ -526,9 +482,7 @@ async function startFingerprintAttendance() {{
                 client_data_json: clientDataJSON,
                 authenticator_data: authData,
                 signature: sig,
-                user_handle: userHandle,
-                latitude: {lat_val},
-                longitude: {lon_val}
+                user_handle: userHandle
             }})
         }});
 
@@ -551,16 +505,10 @@ async function startFingerprintAttendance() {{
             url.searchParams.set('fp_name', name);
             url.searchParams.set('fp_img', img);
             url.searchParams.set('fp_warning', warning);
-            if (status === 'location_violation') {{
-                url.searchParams.set('fp_loc_msg', locMsg);
-            }}
             window.parent.location.href = url.href;
         }} catch(e) {{
             const parentUrl = document.referrer || window.location.href;
             let targetUrl = parentUrl.split('?')[0] + '?fp_status=' + status + '&fp_user_id=' + uid + '&fp_name=' + name + '&fp_img=' + img + '&fp_warning=' + warning;
-            if (status === 'location_violation') {{
-                targetUrl += '&fp_loc_msg=' + locMsg;
-            }}
             const a = document.createElement('a');
             a.href = targetUrl;
             a.target = '_parent';
@@ -609,6 +557,34 @@ async function startFingerprintAttendance() {{
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
 
+            if "scan_stats" not in st.session_state:
+                st.session_state.scan_stats = {"total_scans": 0, "recognized": 0}
+            
+            acc = 0.0
+            if st.session_state.scan_stats["total_scans"] > 0:
+                acc = (st.session_state.scan_stats["recognized"] / st.session_state.scan_stats["total_scans"]) * 100
+                
+            st.markdown(f"""
+            <div style="display: flex; justify-content: space-between; margin-top: 2rem;">
+                <div style="background: white; border-radius: 12px; padding: 1.5rem; text-align: center; width: 23%; box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
+                    <h3 style="color: #60A5FA; font-size: 2rem; margin: 0; font-family: 'Inter', sans-serif; font-weight: 800;">{st.session_state.scan_stats['total_scans']}</h3>
+                    <p style="color: #64748B; font-size: 0.8rem; margin: 0.5rem 0 0 0; font-weight: 600;">Total Scans</p>
+                </div>
+                <div style="background: white; border-radius: 12px; padding: 1.5rem; text-align: center; width: 23%; box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
+                    <h3 style="color: #818CF8; font-size: 2rem; margin: 0; font-family: 'Inter', sans-serif; font-weight: 800;">{st.session_state.scan_stats['recognized']}</h3>
+                    <p style="color: #64748B; font-size: 0.8rem; margin: 0.5rem 0 0 0; font-weight: 600;">Recognized</p>
+                </div>
+                <div style="background: white; border-radius: 12px; padding: 1.5rem; text-align: center; width: 23%; box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
+                    <h3 style="color: #A78BFA; font-size: 2rem; margin: 0; font-family: 'Inter', sans-serif; font-weight: 800;">{acc:.1f}%</h3>
+                    <p style="color: #64748B; font-size: 0.8rem; margin: 0.5rem 0 0 0; font-weight: 600;">Accuracy</p>
+                </div>
+                <div style="background: white; border-radius: 12px; padding: 1.5rem; text-align: center; width: 23%; box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
+                    <h3 style="color: #93C5FD; font-size: 2rem; margin: 0; font-family: 'Inter', sans-serif; font-weight: 800;">54.5%</h3>
+                    <p style="color: #64748B; font-size: 0.8rem; margin: 0.5rem 0 0 0; font-weight: 600;">Attendance Rate</p>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
             if "camera" not in st.session_state or st.session_state.camera is None or not st.session_state.camera.isOpened():
                 # Don't start camera if checkout modal is active
                 if not st.session_state.get("show_leave_confirmation"):
@@ -656,12 +632,41 @@ async function startFingerprintAttendance() {{
                                     user_id = det.get("user_id")
                                     draw_face_overlay(frame, x1, y1, x2, y2, name, user_id, status_det)
                         else:
-                            # Draw default guides
-                            box_w, box_h = int(w * 0.45), int(h * 0.55)
-                            bx1, by1 = int((w - box_w)/2), int((h - box_h)/2)
-                            bx2, by2 = bx1 + box_w, by1 + box_h
-                            cv2.rectangle(frame, (bx1, by1), (bx2, by2), (255, 255, 255), 2)
-                            cv2.putText(frame, "ALIGN FACE HERE", (bx1 + 10, by1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            # Local real-time face detection while backend recognition is processing
+                            local_faces = detect_local_faces(clean_frame)
+
+                            if local_faces:
+                                # Show largest detected face like image 2
+                                local_faces = sorted(
+                                    local_faces,
+                                    key=lambda b: (b[2] - b[0]) * (b[3] - b[1]),
+                                    reverse=True
+                                )
+
+                                x1, y1, x2, y2 = local_faces[0]
+                                draw_face_overlay(
+                                    frame,
+                                    x1, y1, x2, y2,
+                                    "Detecting",
+                                    None,
+                                    "recognized"
+                                )
+                            else:
+                                # Draw default guides only when no face detected
+                                box_w, box_h = int(w * 0.45), int(h * 0.55)
+                                bx1, by1 = int((w - box_w) / 2), int((h - box_h) / 2)
+                                bx2, by2 = bx1 + box_w, by1 + box_h
+
+                                cv2.rectangle(frame, (bx1, by1), (bx2, by2), (255, 255, 255), 2)
+                                cv2.putText(
+                                    frame,
+                                    "ALIGN FACE HERE",
+                                    (bx1 + 10, by1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6,
+                                    (255, 255, 255),
+                                    2
+                                )
                         
                         # Scanning line animation
                         scan_line_y += 8 * scan_dir
@@ -685,16 +690,20 @@ async function startFingerprintAttendance() {{
                             image_bytes = img_encoded.tobytes()
                         
                             try:
-                                res = api.scan_attendance_face(image_bytes, latitude=st.session_state.get("latitude"), longitude=st.session_state.get("longitude"))
+                                res = api.scan_attendance_face(image_bytes)
                                 status = res.get("status")
                             
                                 if status in ["checked_in", "already_completed", "ask_checkout", "not_approved"]:
                                     res["results"] = [{"status": status, "name": res.get("name"), "user_id": res.get("user_id"), "bbox": res.get("bbox", [])}]
                                     status = "recognized_multiple"
                                 
-                                if status == "recognized_multiple":
+                                if res and status == "recognized_multiple":
                                     items = res.get("results", [])
                                     st.session_state.active_scanner_detections = items
+                                    
+                                    # Update stats
+                                    st.session_state.scan_stats["total_scans"] += len(items)
+                                    st.session_state.scan_stats["recognized"] += sum(1 for it in items if it.get("status") not in ["guest", "unknown", "error"])
                                 
                                     need_rerun = False
                                     messages = []
@@ -711,19 +720,21 @@ async function startFingerprintAttendance() {{
                                         if not user_id:
                                             continue
                                         
-                                        # --- ask_checkout: MUST bypass cooldown so confirmation always shows ---
+                                        # --- ask_checkout: MUST bypass 30s cooldown, but use its own 15s cooldown ---
                                         if item_status == "ask_checkout":
-                                            if not st.session_state.get("show_leave_confirmation"):
-                                                st.session_state.pending_checkout_user_id = user_id
-                                                st.session_state.pending_checkout_user_name = item["name"]
-                                                st.session_state.pending_checkout_user_role = item.get("role", "user")
-                                                st.session_state.pending_attendance_method = "face"
-                                                st.session_state.scanned_user = item
-                                                st.session_state.pending_checkout_warning = item.get("warning")
-                                                st.session_state.show_leave_confirmation = True
+                                            last_ask_time = st.session_state.cooldowns.get(f"ask_{user_id}", 0)
+                                            if current_time - last_ask_time >= 15.0:
+                                                if not st.session_state.get("show_leave_confirmation"):
+                                                    st.session_state.pending_checkout_user_id = user_id
+                                                    st.session_state.pending_checkout_user_name = item["name"]
+                                                    st.session_state.pending_checkout_user_role = item.get("role", "user")
+                                                    st.session_state.pending_attendance_method = "face"
+                                                    st.session_state.scanned_user = item
+                                                    st.session_state.pending_checkout_warning = item.get("warning")
+                                                    st.session_state.show_leave_confirmation = True
                                                 st.session_state.scanning = False
                                                 # Remove any stale cooldown so Leave card shows immediately
-                                                st.session_state.cooldowns.pop(user_id, None)
+                                                st.session_state.cooldowns.pop(f"ask_{user_id}", None)
                                                 if "camera" in st.session_state and st.session_state.camera is not None:
                                                     st.session_state.camera.release()
                                                     st.session_state.camera = None
@@ -738,16 +749,11 @@ async function startFingerprintAttendance() {{
                                         
                                         if item_status == "checked_in":
                                             st.session_state.cooldowns[user_id] = current_time
-                                            messages.append(("success", f"✅ {item['name']} marked attendance successfully."))
+                                            messages.append(("success", f"✅ Attendance Marked! Welcome, {item['name']}."))
                                         
                                         elif item_status == "already_completed":
                                             st.session_state.cooldowns[user_id] = current_time
-                                            messages.append(("success", f"✅ {item['name']}'s attendance is already completed."))
-                                        
-                                        elif item_status == "location_error":
-                                            st.session_state.cooldowns[user_id] = current_time
-                                            msg = item.get("message") or "You are not in the allowed location."
-                                            messages.append(("error", f"📍 {item.get('name', 'User')}: {msg}"))
+                                            messages.append(("info", f"ℹ️ Attendance already completed today."))
 
 
                                         elif item_status == "not_approved":
