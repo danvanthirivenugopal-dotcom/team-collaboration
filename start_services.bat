@@ -4,7 +4,10 @@ echo ========================================================
 echo   Face AI Attendance System Setup and Launcher
 echo ========================================================
 echo.
-echo Step 1: Installing Python dependencies...
+echo Step 1: Cleaning up old processes...
+powershell -Command "Get-NetTCPConnection -LocalPort 8000, 8502 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }"
+echo.
+echo Step 2: Installing Python dependencies...
 echo.
 pip install -r requirements.txt -r requirements_backend.txt
 if %errorlevel% neq 0 (

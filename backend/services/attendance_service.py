@@ -76,7 +76,7 @@ def evaluate_checkout_status(
     return hours, final_status
 
 
-def get_today_attendance(user_id: int):
+def get_today_attendance(user_id: int, organization_id: int = 1):
     current_date = datetime.now().date()
 
     with get_db() as conn:
@@ -85,15 +85,15 @@ def get_today_attendance(user_id: int):
                 """
                 SELECT *
                 FROM attendance
-                WHERE user_id = %s AND attendance_date = %s
+                WHERE user_id = %s AND attendance_date = %s AND organization_id = %s
                 LIMIT 1
                 """,
-                (user_id, current_date)
+                (user_id, current_date, organization_id)
             )
             return cursor.fetchone()
 
 
-def get_attendance_settings() -> dict:
+def get_attendance_settings(organization_id: int = 1) -> dict:
     try:
         with get_db() as conn:
             with conn.cursor() as cursor:
@@ -140,13 +140,14 @@ def mark_check_in(
     longitude: float = None,
     fence_id: int = None,
     fence_name: str = None,
-    similarity: float = 1.0
+    similarity: float = 1.0,
+    organization_id: int = 1
 ) -> dict:
     current_date = datetime.now().date()
     now_dt = datetime.now()
     now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    settings = get_attendance_settings()
+    settings = get_attendance_settings(organization_id)
     attendance_status = determine_checkin_status(now_dt, settings)
     is_half_day = attendance_status == "Half Day"
 
@@ -166,9 +167,11 @@ def mark_check_in(
                     checkin_longitude,
                     location_verified,
                     geo_fence_id,
-                    attendance_status
+                    attendance_status,
+                    organization_id
                 )
-                VALUES (%s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE status = status
                 """,
                 (
                     user_id,
@@ -181,7 +184,8 @@ def mark_check_in(
                     longitude,
                     True,
                     fence_id,
-                    attendance_status
+                    attendance_status,
+                    organization_id
                 )
             )
 
@@ -206,7 +210,8 @@ def mark_check_in(
 def mark_check_out(
     user_id: int,
     latitude: float = None,
-    longitude: float = None
+    longitude: float = None,
+    organization_id: int = 1
 ) -> dict:
     from backend.services import geofence_service, audit_service
 
@@ -232,10 +237,11 @@ def mark_check_out(
                 FROM attendance
                 WHERE user_id = %s
                   AND attendance_date = %s
+                  AND organization_id = %s
                   AND check_out_time IS NULL
                 LIMIT 1
                 """,
-                (user_id, current_date)
+                (user_id, current_date, organization_id)
             )
             record = cursor.fetchone()
 
@@ -292,8 +298,8 @@ def mark_check_out(
     }
 
 
-def handle_face_scan_result(user_id: int) -> str:
-    record = get_today_attendance(user_id)
+def handle_face_scan_result(user_id: int, organization_id: int = 1) -> str:
+    record = get_today_attendance(user_id, organization_id)
 
     if not record:
         return "CHECK_IN_MARKED"
@@ -308,7 +314,8 @@ def handle_biometric_attendance(
     user_id: int,
     method: str,
     latitude: float = None,
-    longitude: float = None
+    longitude: float = None,
+    organization_id: int = 1
 ) -> dict:
     from backend.services import geofence_service
 
@@ -348,10 +355,10 @@ def handle_biometric_attendance(
             "user_name": user_name
         }
 
-    record = get_today_attendance(user_id)
+    record = get_today_attendance(user_id, organization_id)
 
     if not record:
-        settings = get_attendance_settings()
+        settings = get_attendance_settings(organization_id)
         now_dt = datetime.now()
         now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
         current_date = now_dt.date()
@@ -368,7 +375,7 @@ def handle_biometric_attendance(
                     WHERE user_id = %s AND attendance_date = %s
                     LIMIT 1
                     """,
-                    (user_id, current_date)
+                    (user_id, current_date, organization_id)
                 )
 
                 if cursor.fetchone():
@@ -430,7 +437,7 @@ def handle_biometric_attendance(
                     if getattr(insert_err, "args", (None,))[0] != 1062:
                         raise
 
-                    record = get_today_attendance(user_id)
+                    record = get_today_attendance(user_id, organization_id)
 
                     if record and record["check_out_time"] is None:
                         existing_method = record.get("attendance_method") or "face"
@@ -453,7 +460,7 @@ def handle_biometric_attendance(
 
                     return {
                         "status": "already_completed",
-                        "message": "Today's attendance is already completed.",
+                        "message": f"{user_name}, today's attendance is already completed.",
                         "user_id": user_id,
                         "method": method,
                         "user_name": user_name
@@ -461,7 +468,7 @@ def handle_biometric_attendance(
 
         return {
             "status": "checked_in",
-            "message": "Attendance marked successfully.",
+            "message": f"{user_name}, attendance successfully marked.",
             "user_id": user_id,
             "method": method,
             "attendance_status": attendance_status,
@@ -480,7 +487,7 @@ def handle_biometric_attendance(
 
         return {
             "status": "ask_checkout",
-            "message": f"{user_name}, Are you leave now?",
+            "message": f"{user_name}, are you leaving now?",
             "user_id": user_id,
             "method": method,
             "warning": warning,

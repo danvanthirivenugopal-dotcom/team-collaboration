@@ -14,7 +14,7 @@ logger = logging.getLogger("faceai.recognizer")
 # ─────────────────────────────────────────────────────────────────────────────
 DEEPFACE_MODEL    = "ArcFace"    # Primary model: 512-dim ArcFace embeddings
 DEEPFACE_FALLBACK = "Facenet512" # Fallback if primary model download fails
-DEEPFACE_DETECTOR = "ssd"        # Face detector: ssd is fast and highly robust compared to opencv
+DEEPFACE_DETECTOR = "ssd" # Face detector: highly robust for multi-face without OOM
 DEEPFACE_ALIGN    = True         # Face alignment improves accuracy
 
 # Active model (will be set to fallback if primary weights fail)
@@ -114,59 +114,54 @@ def get_image_embedding(img: np.ndarray) -> np.ndarray | None:
 
 def get_image_embeddings_all(img: np.ndarray) -> list[tuple[np.ndarray, list[int]]] | None:
     """
-    Detect all faces with the same YOLO face detector used during enrollment,
-    then extract DeepFace embeddings for each face crop.
-
-    IMPORTANT FIX:
-    The old code used InsightFace embeddings for scanning but DeepFace embeddings
-    for enrollment. Those two embedding types are not compatible, so registered
-    faces could be shown as UNKNOWN / NEW USER. This function keeps scanning and
-    enrollment on the same DeepFace embedding model.
+    Detect all faces and extract DeepFace embeddings.
+    Uses the exact same extraction pipeline as get_image_embedding for 100% compatibility.
     """
     if img is None or img.size == 0:
         return None
 
     try:
-        from backend.face_recognition import yolo_detector
+        DeepFace = _get_deepface()
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        representations = DeepFace.represent(
+            img_path=img_rgb,
+            model_name=_active_model,
+            detector_backend=DEEPFACE_DETECTOR,
+            align=DEEPFACE_ALIGN,
+            enforce_detection=False,
+        )
 
-        model = yolo_detector.get_yolo_face_model()
-        detections = model.predict(img, conf=0.25, verbose=False)
-
-        if not detections or len(detections[0].boxes) == 0:
-            logger.info("YOLO face detector: no faces detected")
+        if not representations:
             return None
+            
+        if isinstance(representations, dict):
+            representations = [representations]
 
-        h_img, w_img = img.shape[:2]
-        results: list[tuple[np.ndarray, list[int]]] = []
-
-        for box in detections[0].boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-
-            # Add small margin so DeepFace gets the whole face.
-            margin = 20
-            cx1 = max(0, x1 - margin)
-            cy1 = max(0, y1 - margin)
-            cx2 = min(w_img, x2 + margin)
-            cy2 = min(h_img, y2 + margin)
-
-            if cx2 <= cx1 or cy2 <= cy1:
+        results = []
+        for rep in representations:
+            if rep.get("embedding") is None:
                 continue
+                
+            emb = np.array(rep["embedding"], dtype=np.float32)
+            
+            region = rep.get("facial_area", {})
+            x = region.get("x", 0)
+            y = region.get("y", 0)
+            w = region.get("w", 0)
+            h = region.get("h", 0)
+            
+            # Basic validation of face box
+            if w <= 0 or h <= 0:
+                continue
+                
+            results.append((emb, [x, y, x + w, y + h]))
 
-            face_crop = img[cy1:cy2, cx1:cx2]
-            emb = get_image_embedding(face_crop)
-
-            # Fallback: sometimes DeepFace works better on the full frame.
-            if emb is None:
-                emb = get_image_embedding(img)
-
-            if emb is not None:
-                results.append((emb, [x1, y1, x2, y2]))
-
-        logger.info(f"YOLO + DeepFace: detected {len(results)} faces with compatible embeddings")
+        logger.info(f"DeepFace: detected {len(results)} faces")
         return results if results else None
 
     except Exception as e:
-        logger.error(f"YOLO + DeepFace multi-face embedding failed: {e}")
+        logger.error(f"DeepFace multi-face extraction failed: {e}")
         return None
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -380,13 +375,10 @@ def train_recognizer() -> None:
         with get_db() as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    SELECT id, name
-                    FROM users
-                    WHERE id IN (
-                    SELECT user_id FROM face_embeddings
-                    )
+                    SELECT id, name 
+                    FROM users 
                 """)
-                users = cursor.fetchall()
+            users = cursor.fetchall()
     except Exception as e:
         logger.error(f"Failed to query users for embedding training: {e}")
         return
@@ -491,7 +483,7 @@ def _try_generate_embeddings(user_id: int, enroll_dir: Path) -> bool:
     return False
 
 
-def predict_face(color_img: np.ndarray) -> tuple[int, float] | None:
+def predict_face(color_img: np.ndarray, organization_id: int = 1) -> tuple[int, float] | None:
     """
     Predict identity for the dominant face in an image by comparing its
     DeepFace embedding against all approved users' cached embeddings.
@@ -510,7 +502,11 @@ def predict_face(color_img: np.ndarray) -> tuple[int, float] | None:
     try:
         with get_db() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("SELECT id, name FROM users WHERE LOWER(COALESCE(approval_status,'')) = 'approved' OR LOWER(REPLACE(COALESCE(role,''),' ','_')) IN ('admin','super_admin','superadmin','developer')")
+                cursor.execute("""
+                    SELECT id, name 
+                    FROM users 
+                    WHERE organization_id = %s
+                """, (organization_id,))
                 users = cursor.fetchall()
     except Exception as e:
         logger.error(f"Failed to query approved users: {e}")
@@ -546,8 +542,45 @@ def predict_face(color_img: np.ndarray) -> tuple[int, float] | None:
     logger.info(f"predict_face: no valid match. best_user_id={best_user_id}, best_sim={best_sim:.4f}")
     return None
 
+def _filter_duplicate_face_boxes(face_results: list[tuple[np.ndarray, list[int]]]) -> list[tuple[np.ndarray, list[int]]]:
+    """
+    Remove duplicate overlapping face boxes.
+    Sometimes DeepFace returns multiple boxes for the same face.
+    """
+    if not face_results:
+        return []
 
-def predict_multiple_faces(color_img: np.ndarray) -> list[dict]:
+    filtered = []
+
+    for emb, box in face_results:
+        x1, y1, x2, y2 = box
+        area = max(1, (x2 - x1) * (y2 - y1))
+
+        duplicate = False
+
+        for _, kept_box in filtered:
+            kx1, ky1, kx2, ky2 = kept_box
+
+            ix1 = max(x1, kx1)
+            iy1 = max(y1, ky1)
+            ix2 = min(x2, kx2)
+            iy2 = min(y2, ky2)
+
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            kept_area = max(1, (kx2 - kx1) * (ky2 - ky1))
+            iou = inter / float(area + kept_area - inter)
+
+            if iou > 0.45:
+                duplicate = True
+                break
+
+        if not duplicate:
+            filtered.append((emb, box))
+
+    return filtered
+
+
+def predict_multiple_faces(color_img: np.ndarray, organization_id: int = 1) -> list[dict]:
     """
     Predict identities for ALL faces detected in the image.
 
@@ -558,10 +591,16 @@ def predict_multiple_faces(color_img: np.ndarray) -> list[dict]:
     if not face_results:
         return []
 
+    face_results = _filter_duplicate_face_boxes(face_results)
+
     try:
         with get_db() as conn:
             with conn.cursor() as cursor:
-                cursor.execute("SELECT id, name FROM users WHERE LOWER(COALESCE(approval_status,'')) = 'approved' OR LOWER(REPLACE(COALESCE(role,''),' ','_')) IN ('admin','super_admin','superadmin','developer')")
+                cursor.execute("""
+                    SELECT id, name 
+                    FROM users 
+                    WHERE organization_id = %s
+                """, (organization_id,))
                 users = cursor.fetchall()
     except Exception as e:
         logger.error(f"Failed to query approved users for multi-face prediction: {e}")

@@ -55,12 +55,66 @@ def init_db():
         # Connect to the database and set up tables
         with get_db() as conn:
             with conn.cursor() as cursor:
+                # 0. Organizations
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS organizations (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    organization_uuid VARCHAR(36) UNIQUE NOT NULL,
+                    company_name VARCHAR(255) NOT NULL,
+                    slug VARCHAR(100) UNIQUE NOT NULL,
+                    company_email VARCHAR(191) UNIQUE,
+                    country_code VARCHAR(10),
+                    phone_number VARCHAR(30),
+                    logo_object_key VARCHAR(255),
+                    primary_color VARCHAR(20) DEFAULT '#2563EB',
+                    secondary_color VARCHAR(20) DEFAULT '#60A5FA',
+                    timezone VARCHAR(100) DEFAULT 'UTC',
+                    status ENUM('pending', 'trial', 'active', 'suspended', 'cancelled', 'archived') DEFAULT 'active',
+                    created_by_user_id BIGINT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                );
+                """)
+                cursor.execute("SELECT id FROM organizations WHERE id=1")
+                if not cursor.fetchone():
+                    cursor.execute("INSERT IGNORE INTO organizations (id, organization_uuid, company_name, slug) VALUES (1, UUID(), 'Default Organization', 'default-org')")
+
+                # 0.1 Registration Sessions
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS registration_sessions (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    registration_token_hash VARCHAR(255) NOT NULL,
+                    registration_type ENUM('company', 'employee') NOT NULL,
+                    organization_id BIGINT NULL,
+                    company_name VARCHAR(255) NULL,
+                    full_name VARCHAR(150),
+                    email VARCHAR(191),
+                    country_code VARCHAR(10),
+                    phone_number VARCHAR(30),
+                    captcha_verified BOOLEAN DEFAULT FALSE,
+                    face_enrollment_completed BOOLEAN DEFAULT FALSE,
+                    fingerprint_completed BOOLEAN DEFAULT FALSE,
+                    status ENUM('active', 'completed', 'expired') DEFAULT 'active',
+                    expires_at TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_reg_token (registration_token_hash)
+                );
+                """)
+
+                # 1b. Geolocation Settings (needs organization_id)
+                try:
+                    cursor.execute("SELECT organization_id FROM geolocation_settings LIMIT 1")
+                except Exception:
+                    cursor.execute("ALTER TABLE geolocation_settings ADD COLUMN organization_id INT NULL DEFAULT 1")
+                
                 # 1. Users
                 cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    organization_id BIGINT NULL DEFAULT 1,
                     name VARCHAR(150) NOT NULL,
-                    email VARCHAR(191) NOT NULL UNIQUE,
+                    email VARCHAR(191) NOT NULL,
                     phone_number VARCHAR(30) NOT NULL,
                     department VARCHAR(100) NULL,
                     password VARCHAR(255) NOT NULL,
@@ -72,7 +126,9 @@ def init_db():
                     login_attempts BIGINT DEFAULT 0,
                     lockout_until TIMESTAMP NULL,
                     fingerprint_embedding BLOB NULL,
-                    fingerprint_updated_at DATETIME NULL
+                    fingerprint_updated_at DATETIME NULL,
+                    UNIQUE KEY uq_user_email_org (organization_id, email),
+                    CONSTRAINT fk_users_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
                 );
                 """)
                 
@@ -114,9 +170,11 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS face_embeddings (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT NOT NULL,
+                    organization_id BIGINT NULL DEFAULT 1,
                     embedding_path VARCHAR(255) NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_face_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
                 );
                 """)
                 
@@ -125,6 +183,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS attendance (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT NOT NULL,
+                    organization_id BIGINT NULL DEFAULT 1,
                     attendance_date DATE NOT NULL,
                     check_in_time DATETIME NOT NULL,
                     check_out_time DATETIME NULL,
@@ -132,8 +191,10 @@ def init_db():
                     image_path VARCHAR(255) NULL,
                     confidence FLOAT NULL,
                     half_day BOOLEAN DEFAULT FALSE,
+                    attendance_method ENUM('face','fingerprint') DEFAULT 'face',
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-                    UNIQUE KEY unique_user_daily_attendance (user_id, attendance_date)
+                    UNIQUE KEY unique_user_daily_attendance (organization_id, user_id, attendance_date),
+                    CONSTRAINT fk_att_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
                 );
                 """)
                 
@@ -154,9 +215,11 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS attendance_logs (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT NULL,
+                    organization_id BIGINT NULL DEFAULT 1,
                     action VARCHAR(255) NOT NULL,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    image_path VARCHAR(255) NULL
+                    image_path VARCHAR(255) NULL,
+                    CONSTRAINT fk_att_logs_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
                 );
                 """)
                 # Drop captcha_verifications table if it doesn't match the expected schema (e.g., missing captcha_key)
@@ -180,10 +243,12 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS audit_logs (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT NULL,
+                    organization_id BIGINT NULL DEFAULT 1,
                     action VARCHAR(255) NOT NULL,
                     target_user_id BIGINT NULL,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_audit_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
                 );
                 """)
 
@@ -192,10 +257,12 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS comments (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT NULL,
+                    organization_id BIGINT NULL DEFAULT 1,
                     mail_id VARCHAR(191) NOT NULL,
                     comment_text TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE KEY unique_comment_mail (mail_id)
+                    UNIQUE KEY unique_comment_mail (mail_id),
+                    CONSTRAINT fk_comments_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
                 );
                 """)
                 
@@ -289,6 +356,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS webauthn_credentials (
                     id BIGINT AUTO_INCREMENT PRIMARY KEY,
                     user_id BIGINT NOT NULL,
+                    organization_id BIGINT NULL DEFAULT 1,
                     credential_id VARCHAR(512) NOT NULL UNIQUE,
                     public_key TEXT NOT NULL,
                     sign_count BIGINT DEFAULT 0,
@@ -296,6 +364,7 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    CONSTRAINT fk_webauthn_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE,
                     INDEX idx_webauthn_user (user_id)
                 );
                 """)
@@ -307,36 +376,100 @@ def init_db():
                     cursor.execute(
                         "ALTER TABLE attendance ADD COLUMN attendance_method ENUM('face','fingerprint') DEFAULT 'face'"
                     )
+                
+                # 11. Geolocation Settings
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS geolocation_settings (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(150) DEFAULT 'Headquarters',
+                    organization_id BIGINT NULL DEFAULT 1,
+                    latitude DOUBLE NULL,
+                    longitude DOUBLE NULL,
+                    radius INT DEFAULT 50,
+                    updated_by BIGINT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    FOREIGN KEY (updated_by) REFERENCES users(id) ON DELETE SET NULL,
+                    CONSTRAINT fk_geo_org FOREIGN KEY (organization_id) REFERENCES organizations(id) ON DELETE CASCADE
+                );
+                """)
+                
+                # Migration: add name column if missing
+                try:
+                    cursor.execute("SELECT name FROM geolocation_settings LIMIT 1")
+                except Exception:
+                    cursor.execute(
+                        "ALTER TABLE geolocation_settings ADD COLUMN name VARCHAR(150) DEFAULT 'Headquarters' AFTER id"
+                    )
+                
+                # Seed default geolocation settings row if none exists
+                cursor.execute("SELECT id FROM geolocation_settings LIMIT 1")
+                if not cursor.fetchone():
+                    cursor.execute("""
+                    INSERT INTO geolocation_settings (name, latitude, longitude, radius)
+                    VALUES ('Headquarters', NULL, NULL, 50)
+                    """)
+                    logger.info("Default geolocation settings seeded.")
+# Run migration to add half_day if it doesn't exist
+                try:
+                    cursor.execute("SELECT half_day FROM attendance LIMIT 1")
+                except Exception:
+                    cursor.execute("ALTER TABLE attendance ADD COLUMN half_day BOOLEAN DEFAULT FALSE")
+                
+                # 12. Location Violation Logs
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS location_violation_logs (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    user_id BIGINT NULL,
+                    user_name VARCHAR(150) NULL,
+                    latitude DOUBLE NULL,
+                    longitude DOUBLE NULL,
+                    reason VARCHAR(255) NOT NULL,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+                    INDEX idx_timestamp (timestamp)
+                );
+                """)
             
             # Run enterprise feature migrations inside the active connection context
             import os
-            migration_file = os.path.join(os.path.dirname(__file__), "migrations", "v2_enterprise_upgrade.sql")
-            if os.path.exists(migration_file):
-                logger.info("Applying enterprise migrations inside active connection...")
-                with open(migration_file, "r", encoding="utf-8") as f:
-                    sql = f.read()
-                statements = []
-                current = []
+            migrations_dir = os.path.join(os.path.dirname(__file__), "migrations")
+            if os.path.exists(migrations_dir):
+                migration_files = sorted([f for f in os.listdir(migrations_dir) if f.endswith('.sql')])
+                for m_file in migration_files:
+                    migration_file = os.path.join(migrations_dir, m_file)
+                    logger.info(f"Applying enterprise migrations {m_file} inside active connection...")
+                    with open(migration_file, "r", encoding="utf-8") as f:
+                        sql = f.read()
+                    statements = []
+                    current = []
 
-                for line in sql.splitlines():
-                    stripped = line.strip()
-                    if not stripped or stripped.startswith("--"):
-                        continue
+                    for line in sql.splitlines():
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith("--"):
+                            continue
 
-                    current.append(line)
+                        current.append(line)
 
-                    if stripped.endswith(";"):
-                        stmt = "\n".join(current).strip().rstrip(";")
-                        if stmt:
-                            statements.append(stmt)
-                        current = []
-                with conn.cursor() as cursor:
-                    for stmt in statements:
-                        lines = [line for line in stmt.split("\n") if not line.strip().startswith("--")]
-                        clean_stmt = "\n".join(lines).strip()
-                        if clean_stmt:
-                            cursor.execute(clean_stmt)
-                logger.info("Enterprise migrations applied.")
+                        if stripped.endswith(";"):
+                            stmt = "\n".join(current).strip().rstrip(";")
+                            if stmt:
+                                statements.append(stmt)
+                            current = []
+                    with conn.cursor() as cursor:
+                        for stmt in statements:
+                            lines = [line for line in stmt.split("\n") if not line.strip().startswith("--")]
+                            clean_stmt = "\n".join(lines).strip()
+                            if clean_stmt:
+                                try:
+                                    cursor.execute(clean_stmt)
+                                except Exception as e:
+                                    # Ignore drop index and old column errors during migrations
+                                    if "DROP INDEX" in clean_stmt or "Duplicate column name" in str(e) or "Duplicate key name" in str(e) or "Duplicate foreign key constraint name" in str(e) or "Unknown column" in str(e):
+                                        pass
+                                    else:
+                                        logger.error(f"Migration error: {e} in statement: {clean_stmt}")
+                                        raise e
+                    logger.info(f"Enterprise migrations {m_file} applied.")
 
             logger.info("Database initialized successfully.")
     except Exception as e:

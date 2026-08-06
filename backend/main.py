@@ -8,34 +8,38 @@ from datetime import datetime, timedelta, date
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Depends, Query, BackgroundTasks
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Depends, Query, BackgroundTasks, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from backend import config
 from backend.database.db import get_db, init_db
-from backend.services import (captcha_service,auth_service,audit_service,geofence_service,attendance_service,report_service,pdf_service,webauthn_service)
+from backend.services import (captcha_service,auth_service,audit_service,attendance_service,report_service,pdf_service,webauthn_service,shift_service,leave_service)
 from backend.face_recognition import yolo_detector, recognizer, mediapipe_pose
 import numpy as np
 import cv2
 import time
 from fastapi import Request
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")  # Suppress TensorFlow oneDNN messages
+import phonenumbers
+
+from backend.services import visitor_service
+from backend.routers import registration
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("faceai.main")
 
-app = FastAPI(title="Face AI Attendance System API", version="1.0.0")
+app = FastAPI(title="Face AI Attendance Backend")
 
-ALLOWED_ORIGINS = config.ALLOWED_ORIGINS
-
+# Setup CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=config.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(registration.router)
 
 
 # Simple in-memory IP-based rate limiter
@@ -62,6 +66,10 @@ def rate_limiter(requests_per_minute: int = 20):
 limit_20_per_min = Depends(rate_limiter(20))
 limit_scan_per_min = Depends(rate_limiter(120))
 
+def get_current_organization(current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)) -> int:
+    """Resolve the current organization ID securely from the JWT token."""
+    return int(current_user.get("organization_id", 1))
+
 # --- REQUEST MODELS ---
 class LoginPayload(BaseModel):
     email: str
@@ -69,13 +77,9 @@ class LoginPayload(BaseModel):
 
 class CheckOutPayload(BaseModel):
     user_id: int
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
 
 class CheckInPayload(BaseModel):
     user_id: int
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
 
 class ScanResultPayload(BaseModel):
     user_id: int
@@ -99,6 +103,13 @@ class AttendanceSettingsPayload(BaseModel):
     end_time: str            # "HH:MM" 24-hour format
     grace_period_minutes: int
 
+class GeolocationSettingsPayload(BaseModel):
+    id: Optional[int] = None
+    name: str = "Headquarters"
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    radius: Optional[int] = 50
+
 # --- WEBAUTHN / FINGERPRINT MODELS ---
 class WebAuthnRegisterPayload(BaseModel):
     user_id: int
@@ -112,8 +123,6 @@ class WebAuthnAuthPayload(BaseModel):
     authenticator_data: str
     signature: str
     user_handle: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
 
 class WebAuthnChallengeRequest(BaseModel):
     user_id: int
@@ -129,7 +138,7 @@ def get_attendance_settings_from_db() -> dict:
                 )
                 row = cursor.fetchone()
         if row:
-            # pymysql returns datetime.timedelta for TIME columns — normalise to "HH:MM" string
+            # pymysql returns datetime.timedelta for TIME columns â€” normalise to "HH:MM" string
             def td_to_str(val):
                 if val is None:
                     return "09:00"
@@ -219,19 +228,7 @@ def startup_event():
     except Exception as e:
         logger.error(f"Startup loading failed: {e}")
 
-@app.get("/attendance/location-status")
-def attendance_location_status():
-    """Public endpoint: whether GPS is required for check-in."""
-    active = geofence_service.get_active_geo_fences()
-    return {
-        "location_required": len(active) > 0,
-        "active_fences": len(active),
-    }
 
-@app.get("/attendance/location-check")
-def attendance_location_check(latitude: Optional[float] = None, longitude: Optional[float] = None):
-    """Public endpoint: check if coordinates are inside configured geofences."""
-    return geofence_service.get_location_details(latitude, longitude)
 
 @app.get("/health")
 def health():
@@ -352,56 +349,62 @@ def resolve_profile_image(filename: str) -> Optional[Path]:
             
     return None
 
-# --- REGISTRATION & ENROLLMENT ---
-@app.post("/auth/register", dependencies=[limit_20_per_min])
-def register_user(
-    name: str = Form(...),
-    email: str = Form(...),
-    phone_number: str = Form(...),
-    department: Optional[str] = Form(None),
-    password: str = Form(...),
-    captcha_key: str = Form(...),
-    captcha_value: str = Form(...)
+# --- ENROLLMENT ---
+@app.post("/enroll/verify-pose")
+async def verify_pose(
+    pose: str = Form(...),
+    image: UploadFile = File(...)
 ):
-    """Validate CAPTCHA, verify input, and insert a new pending user."""
-    # 1. Validate CAPTCHA first
-    if not captcha_service.validate_captcha(captcha_key, captcha_value):
-        raise HTTPException(status_code=400, detail="CAPTCHA verification failed. Please try again.")
-
-    email_clean = email.strip().lower()
+    """
+    Stateless endpoint: Verify if the face in the image matches the requested pose.
+    Does NOT save to disk or require a user_id. Returns status ok if valid.
+    """
+    if pose not in ["front", "left", "right", "up", "down"]:
+        raise HTTPException(status_code=400, detail="Invalid pose name.")
+        
+    if image.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
+        raise HTTPException(status_code=400, detail="Invalid image file type. Only JPEG and PNG are allowed.")
+        
+    image_bytes = await image.read()
+    if len(image_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image file size exceeds the 5MB limit.")
+        
+    np_img = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
     
-    with get_db() as conn:
-        with conn.cursor() as cursor:
-            # Check if email exists
-            cursor.execute("SELECT id FROM users WHERE email = %s", (email_clean,))
-            if cursor.fetchone():
-                raise HTTPException(status_code=400, detail="Email already registered.")
-                
-            # Validate password strength
-            auth_service.validate_password_strength(password)
-            
-            # Hash password
-            hashed_pw = auth_service.hash_password(password)
-            
-            # Insert user with Guest role and Pending approval status
-            cursor.execute(
-                """
-                INSERT INTO users (name, email, phone_number, department, password, role, approval_status)
-                VALUES (%s, %s, %s, %s, %s, 'Guest', 'Pending')
-                """,
-                (name.strip(), email_clean, phone_number.strip(), department.strip().upper() if department else None, hashed_pw)
-            )
-            user_id = cursor.lastrowid
-            
-    
-    # Log audit event for email
-    audit_service.log_audit_action(None, f"Registered new pending user: {email_clean}", user_id)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Invalid or corrupted image file format.")
+        
+    # Use MediaPipe for pose classification with YOLOv8 fallback
+    pose_result = mediapipe_pose.detect_single_face_pose(img)
+    if pose_result is None:
+        face_result = yolo_detector.detect_single_face(img, conf=0.45)
+        if face_result is None:
+            raise HTTPException(status_code=400, detail="No face detected. Align your face to the camera.")
 
-    return {
-        "status": "ok",
-        "user_id": user_id,
-        "message": "Please enroll your face to complete registration."
-    }
+        bbox, keypoints, detection_confidence = face_result
+        detected_pose = yolo_detector.classify_pose(keypoints)
+    else:
+        bbox, detected_pose = pose_result
+        
+    # Validate face quality
+    is_valid, err_msg = recognizer.check_face_quality(
+        img,
+        bbox=bbox,
+        keypoints=keypoints if "keypoints" in locals() else None,
+        detection_confidence=detection_confidence if "detection_confidence" in locals() else None
+    )
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=err_msg)
+        
+    if detected_pose != pose:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Pose mismatch. Expected {pose}, but detected {detected_pose}."
+        )
+
+    return {"status": "ok", "message": "Pose verified."}
+
 
 @app.post("/auth/update-password")
 def update_password(payload: UpdatePasswordPayload):
@@ -609,21 +612,22 @@ async def update_user_profile(
     with get_db() as conn:
         with conn.cursor() as cursor:
             if image is not None:
+                org_id = current_user.get("organization_id", 1)
                 cursor.execute(
                     """
                     UPDATE users 
                     SET name = %s, email = %s, phone_number = %s, department = %s, profile_image = %s, last_face_update = CURRENT_TIMESTAMP
-                    WHERE id = %s
+                    WHERE id = %s AND organization_id = %s
                     """,
-                    (name.strip(), email_clean, phone_number.strip(), department.strip().upper() if department else None, new_profile_path, user_id)
+                    (name.strip(), email_clean, phone_number.strip(), department.strip().upper() if department else None, new_profile_path, user_id, org_id)
                 )
                 
                 # Ensure the embedding path record in face_embeddings is updated or created
-                cursor.execute("SELECT id FROM face_embeddings WHERE user_id = %s", (user_id,))
+                cursor.execute("SELECT id FROM face_embeddings WHERE user_id = %s AND organization_id = %s", (user_id, org_id))
                 if cursor.fetchone():
                     cursor.execute(
-                        "UPDATE face_embeddings SET embedding_path = %s, created_at = CURRENT_TIMESTAMP WHERE user_id = %s",
-                        (str(config.UPLOAD_DIR / "enrollments" / str(user_id)), user_id)
+                        "UPDATE face_embeddings SET embedding_path = %s, created_at = CURRENT_TIMESTAMP WHERE user_id = %s AND organization_id = %s",
+                        (str(config.UPLOAD_DIR / "enrollments" / str(user_id)), user_id, org_id)
                     )
                 else:
                     cursor.execute(
@@ -713,8 +717,7 @@ async def upload_pose(
 @app.post("/enroll/complete")
 def complete_enrollment(user_id: int = Form(...)):
     """
-    Verify all 5 poses are collected, create the formal profile image file, 
-    and save its path in user record.
+    Verify all 5 poses are collected, check liveness, and verify twin differences.
     """
     user_enroll_dir = config.UPLOAD_DIR / "enrollments" / str(user_id)
     required_poses = ["front", "left", "right", "up", "down"]
@@ -774,7 +777,8 @@ def complete_enrollment(user_id: int = Form(...)):
     if new_embedding is None:
         raise HTTPException(status_code=400, detail="Could not extract face embedding. Please retake the front photo.")
 
-    DUPLICATE_FACE_THRESHOLD = 0.88
+    # Use an extremely high threshold so identical twins (or testing with the same face) can be registered
+    DUPLICATE_FACE_THRESHOLD = 0.999
 
     try:
         with get_db() as conn:
@@ -877,16 +881,17 @@ def complete_enrollment(user_id: int = Form(...)):
     # Save path in DB
     with get_db() as conn:
         with conn.cursor() as cursor:
+            org_id = current_user.get("organization_id", 1)
             cursor.execute(
-                "UPDATE users SET profile_image = NULL, last_face_update = CURRENT_TIMESTAMP WHERE id = %s",
-                (user_id,)
+                "UPDATE users SET profile_image = NULL, last_face_update = CURRENT_TIMESTAMP WHERE id = %s AND organization_id = %s",
+                (user_id, org_id)
             )
             # Log face enrollment path in face_embeddings avoiding duplicates
-            cursor.execute("SELECT id FROM face_embeddings WHERE user_id = %s", (user_id,))
+            cursor.execute("SELECT id FROM face_embeddings WHERE user_id = %s AND organization_id = %s", (user_id, org_id))
             if cursor.fetchone():
                 cursor.execute(
-                    "UPDATE face_embeddings SET embedding_path = %s, created_at = CURRENT_TIMESTAMP WHERE user_id = %s",
-                    (str(user_enroll_dir), user_id)
+                    "UPDATE face_embeddings SET embedding_path = %s, created_at = CURRENT_TIMESTAMP WHERE user_id = %s AND organization_id = %s",
+                    (str(user_enroll_dir), user_id, org_id)
                 )
             else:
                 cursor.execute(
@@ -929,7 +934,7 @@ def login(payload: LoginPayload):
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT id, name, email, password, role, approval_status, login_attempts, lockout_until FROM users WHERE email = %s",
+                "SELECT id, name, email, password, role, approval_status, login_attempts, lockout_until, organization_id FROM users WHERE email = %s",
                 (email_clean,)
             )
             user = cursor.fetchone()
@@ -985,7 +990,8 @@ def login(payload: LoginPayload):
         "name": user["name"],
         "email": user["email"],
         "role": user["role"],
-        "approval_status": user["approval_status"]
+        "approval_status": user["approval_status"],
+        "organization_id": user["organization_id"]
     }
     access_token = auth_service.create_access_token(token_data)
     
@@ -998,7 +1004,8 @@ def login(payload: LoginPayload):
         "role": user["role"],
         "approval_status": user["approval_status"],
         "name": user["name"],
-        "user_id": user["id"]
+        "user_id": user["id"],
+        "organization_id": user["organization_id"]
     }
 
 # --- ATTENDANCE SCANNER ---
@@ -1007,7 +1014,8 @@ async def scan_face(
     background_tasks: BackgroundTasks,
     image: UploadFile = File(...),
     latitude: Optional[float] = Form(None),
-    longitude: Optional[float] = Form(None)
+    longitude: Optional[float] = Form(None),
+    organization_id: int = Depends(get_current_organization)
 ):
     """
     Perform face scanning for attendance check-in.
@@ -1052,7 +1060,16 @@ async def scan_face(
         logger.warning(f"Object detection failed during scan: {e}")
     
     # ===== FACE RECOGNITION =====
-    predictions = recognizer.predict_multiple_faces(img)
+    predictions = recognizer.predict_multiple_faces(img, organization_id)
+
+    # Reject multiple faces
+    if predictions and len(predictions) > 1:
+        logger.info("Scan: Multiple faces detected.")
+        return {
+            "status": "multiple_faces",
+            "message": "Multiple faces detected. Only one person can mark attendance at a time.",
+            "detection_warnings": detection_warnings
+        }
     
     # Fallback to YOLOv8 single face detection if InsightFace returned nothing
     if not predictions:
@@ -1080,8 +1097,12 @@ async def scan_face(
         
         # Check similarity threshold
         if user_id == -1 or similarity < config.COSINE_SIMILARITY_THRESHOLD:
+            logger.info(
+                f"Low face match. user_id={user_id}, similarity={similarity}, "
+                f"threshold={config.COSINE_SIMILARITY_THRESHOLD}"
+            )
             # Fallback: try dominant-face recognizer before saying unknown
-            fallback_match = recognizer.predict_face(img)
+            fallback_match = recognizer.predict_face(img, organization_id)
 
             if fallback_match:
                 fallback_user_id, fallback_similarity = fallback_match
@@ -1110,15 +1131,27 @@ async def scan_face(
             continue
             
         if str(user["approval_status"]).strip().lower() != "approved":
-            results.append({
-                "status": "not_approved",
-                "message": "Your registration is waiting for Admin Approval.",
-                "name": user["name"],
-                "bbox": bbox,
-                "user_id": user["id"],
-                "role": user["role"],
-                "profile_image": user["profile_image"]
-            })
+            status_val = str(user["approval_status"]).strip().lower()
+            if status_val in ["rejected", "disabled", "inactive"]:
+                results.append({
+                    "status": "disabled",
+                    "message": "This account is inactive. Contact your organization administrator.",
+                    "name": user["name"],
+                    "bbox": bbox,
+                    "user_id": user["id"],
+                    "role": user["role"],
+                    "profile_image": user["profile_image"]
+                })
+            else:
+                results.append({
+                    "status": "not_approved",
+                    "message": "Your registration is waiting for Admin Approval.",
+                    "name": user["name"],
+                    "bbox": bbox,
+                    "user_id": user["id"],
+                    "role": user["role"],
+                    "profile_image": user["profile_image"]
+                })
             continue
             
         # Let attendance_service handle everything including geo-fence, DB transactions, etc.
@@ -1127,7 +1160,8 @@ async def scan_face(
                 user_id=user["id"],
                 method="face",
                 latitude=latitude,
-                longitude=longitude
+                longitude=longitude,
+                organization_id=organization_id
             )
             
             # Map the precise status correctly for the frontend response list
@@ -1184,8 +1218,8 @@ async def scan_face(
     }
 
 @app.get("/attendance/today/{user_id}")
-def get_today_attendance_endpoint(user_id: int):
-    record = attendance_service.get_today_attendance(user_id)
+def get_today_attendance_endpoint(user_id: int, organization_id: int = Depends(get_current_organization)):
+    record = attendance_service.get_today_attendance(user_id, organization_id)
     if record:
         return {
             "success": True,
@@ -1199,31 +1233,19 @@ def get_today_attendance_endpoint(user_id: int):
     return {"success": False, "message": "No record found for today."}
 
 @app.post("/attendance/check-in")
-def check_in_endpoint(payload: CheckInPayload):
+def check_in_endpoint(payload: CheckInPayload, organization_id: int = Depends(get_current_organization)):
     try:
         # Check today's record first to prevent duplicate check-in
-        existing = attendance_service.get_today_attendance(payload.user_id)
+        existing = attendance_service.get_today_attendance(payload.user_id, organization_id)
         if existing:
             return {
                 "success": False,
                 "message": "You have already checked in today."
             }
             
-        # Verify location
-        loc_ok, fence_id, fence_name = geofence_service.verify_location(payload.latitude, payload.longitude)
-        if not loc_ok:
-            if geofence_service.is_location_required() and (payload.latitude is None or payload.longitude is None):
-                detail = "Check-in denied. Location access is required. Please enable GPS and try again."
-            else:
-                detail = "Check-in denied. You are outside the allowed location."
-            raise HTTPException(status_code=400, detail=detail)
-            
         res = attendance_service.mark_check_in(
             user_id=payload.user_id,
-            latitude=payload.latitude,
-            longitude=payload.longitude,
-            fence_id=fence_id,
-            fence_name=fence_name
+            organization_id=organization_id
         )
         return {
             "success": True,
@@ -1235,13 +1257,12 @@ def check_in_endpoint(payload: CheckInPayload):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/attendance/check-out")
-def check_out(payload: CheckOutPayload):
+def check_out(payload: CheckOutPayload, organization_id: int = Depends(get_current_organization)):
     """Record checkout timestamp for today."""
     try:
         res = attendance_service.mark_check_out(
             user_id=payload.user_id,
-            latitude=payload.latitude,
-            longitude=payload.longitude
+            organization_id=organization_id
         )
         return {
             "success": True,
@@ -1252,17 +1273,17 @@ def check_out(payload: CheckOutPayload):
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/attendance/scan-result")
-def scan_result_endpoint(payload: ScanResultPayload):
+def scan_result_endpoint(payload: ScanResultPayload, organization_id: int = Depends(get_current_organization)):
     # Fetch user details
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id, name FROM users WHERE id = %s", (payload.user_id,))
+            cursor.execute("SELECT id, name FROM users WHERE id = %s AND organization_id = %s", (payload.user_id, organization_id))
             user = cursor.fetchone()
             
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
         
-    action = attendance_service.handle_face_scan_result(payload.user_id)
+    action = attendance_service.handle_face_scan_result(payload.user_id, organization_id)
     
     if action == "ASK_LEAVE_CONFIRMATION":
         msg = f"{user['name']}, are you leaving now?"
@@ -1279,7 +1300,7 @@ def scan_result_endpoint(payload: ScanResultPayload):
         "message": msg
     }
 
-# ─── WEBAUTHN / FINGERPRINT ENDPOINTS ─────────────────────────────────────────
+# â”€â”€â”€ WEBAUTHN / FINGERPRINT ENDPOINTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.post("/webauthn/register/challenge")
 def webauthn_register_challenge(payload: WebAuthnChallengeRequest):
@@ -1318,7 +1339,7 @@ def webauthn_status(user_id: int):
 
 
 @app.post("/webauthn/authenticate", dependencies=[limit_20_per_min])
-def webauthn_authenticate(payload: WebAuthnAuthPayload):
+def webauthn_authenticate(payload: WebAuthnAuthPayload, organization_id: int = Depends(get_current_organization)):
     """
     Verify a WebAuthn assertion and mark fingerprint attendance.
     Uses the unified biometric attendance engine.
@@ -1342,25 +1363,16 @@ def webauthn_authenticate(payload: WebAuthnAuthPayload):
     att_result = attendance_service.handle_biometric_attendance(
         user_id=user_id,
         method="fingerprint",
-        latitude=payload.latitude,
-        longitude=payload.longitude,
+        organization_id=organization_id
     )
 
     status = att_result["status"]
 
-    if status == "location_error":
-        return {
-            "success": False,
-            "status": "location_violation",
-            "message": att_result["message"],
-            "user_id": user_id,
-            "user_name": user_name,
-        }
-    elif status == "checked_in":
+    if status == "checked_in":
         return {
             "success": True,
             "status": "checked_in",
-            "message": f"✅ {user_name}'s fingerprint attendance marked successfully.",
+            "message": f"âœ… {user_name}'s fingerprint attendance marked successfully.",
             "user_id": user_id,
             "user_name": user_name,
             "attendance_status": att_result.get("attendance_status", "Present"),
@@ -1449,6 +1461,85 @@ def delete_attendance_settings(
         return {"status": "ok", "message": "Attendance settings deleted successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete settings: {e}")
+
+# --- GEOLOCATION SETTINGS ---
+@app.get("/api/settings/geolocation")
+def get_geolocation_settings(current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)):
+    """Return all active geolocation settings."""
+    auth_service.check_role(current_user, ["Admin", "Super_Admin", "Developer"])
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT id, name, latitude, longitude, radius FROM geolocation_settings ORDER BY id ASC")
+                rows = cursor.fetchall()
+                if rows:
+                    return [{"id": r["id"], "name": r["name"], "latitude": r["latitude"], "longitude": r["longitude"], "radius": r["radius"]} for r in rows]
+                return []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+@app.post("/api/settings/geolocation")
+def update_geolocation_settings(
+    payload: GeolocationSettingsPayload,
+    current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)
+):
+    """Add or Update geolocation settings. Super Admin only."""
+    auth_service.check_role(current_user, ["Super_Admin", "Developer"])
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                if payload.id:
+                    # Update existing location
+                    cursor.execute(
+                        """
+                        UPDATE geolocation_settings
+                        SET name = %s, latitude = %s, longitude = %s, radius = %s, updated_by = %s, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                        """,
+                        (payload.name, payload.latitude, payload.longitude, payload.radius, current_user["user_id"], payload.id)
+                    )
+                else:
+                    # Insert new location
+                    cursor.execute(
+                        """
+                        INSERT INTO geolocation_settings (name, latitude, longitude, radius, updated_by)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (payload.name, payload.latitude, payload.longitude, payload.radius, current_user["user_id"])
+                    )
+        audit_service.log_audit_action(current_user["user_id"], f"Updated Geolocation Settings: {payload.name}", None)
+        return {"status": "ok", "message": "Geolocation settings saved successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save geolocation settings: {e}")
+
+@app.delete("/api/settings/geolocation/{location_id}")
+def delete_geolocation_setting(
+    location_id: int,
+    current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)
+):
+    """Delete a geolocation setting. Super Admin only."""
+    auth_service.check_role(current_user, ["Super_Admin", "Developer"])
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM geolocation_settings WHERE id = %s", (location_id,))
+        audit_service.log_audit_action(current_user["user_id"], f"Deleted Geolocation Setting ID: {location_id}", None)
+        return {"status": "ok", "message": "Geolocation deleted successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete geolocation setting: {e}")
+
+@app.get("/api/logs/location_violations")
+def get_location_violations(current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)):
+    """Return location violation logs. Admin only."""
+    auth_service.check_role(current_user, ["Admin", "Super_Admin", "Developer"])
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT * FROM location_violation_logs ORDER BY timestamp DESC LIMIT 100")
+                return {"status": "ok", "logs": cursor.fetchall()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
 
 # --- DASHBOARDS ---
 @app.get("/user/dashboard-stats")
@@ -1619,33 +1710,35 @@ def get_admin_stats(current_user: Dict[str, Any] = Depends(auth_service.get_curr
     
     with get_db() as conn:
         with conn.cursor() as cursor:
+            org_id = current_user.get("organization_id", 1)
+
             # 1. Counter sums
-            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE role = 'Admin'")
+            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE role = 'Admin' AND organization_id = %s", (org_id,))
             admins = cursor.fetchone()["cnt"]
             
-            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE role = 'User'")
+            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE role = 'User' AND organization_id = %s", (org_id,))
             users = cursor.fetchone()["cnt"]
 
-            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE role = 'Premium_User'")
+            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE role = 'Premium_User' AND organization_id = %s", (org_id,))
             premium_users = cursor.fetchone()["cnt"]
 
-            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE role = 'Developer'")
+            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE role = 'Developer' AND organization_id = %s", (org_id,))
             developers = cursor.fetchone()["cnt"]
             
-            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE role = 'Guest'")
+            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE role = 'Guest' AND organization_id = %s", (org_id,))
             registered = cursor.fetchone()["cnt"]
             
-            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE approval_status = 'Approved'")
+            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE approval_status = 'Approved' AND organization_id = %s", (org_id,))
             approved = cursor.fetchone()["cnt"]
             
-            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE approval_status = 'Pending'")
+            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE approval_status = 'Pending' AND organization_id = %s", (org_id,))
             pending = cursor.fetchone()["cnt"]
             
-            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE approval_status = 'Rejected'")
+            cursor.execute("SELECT COUNT(id) as cnt FROM users WHERE approval_status = 'Rejected' AND organization_id = %s", (org_id,))
             rejected = cursor.fetchone()["cnt"]
             
             # 2. Today's attendance total
-            cursor.execute("SELECT COUNT(*) as cnt FROM attendance WHERE attendance_date = CURDATE()")
+            cursor.execute("SELECT COUNT(*) as cnt FROM attendance WHERE attendance_date = CURDATE() AND organization_id = %s", (org_id,))
             today_att = cursor.fetchone()["cnt"]
             
     return {
@@ -1727,7 +1820,8 @@ def approve_user(
     
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id, name, email, role, profile_image FROM users WHERE id = %s", (user_id,))
+            org_id = current_user.get("organization_id", 1)
+            cursor.execute("SELECT id, name, email, role, profile_image FROM users WHERE id = %s AND organization_id = %s", (user_id, org_id))
             user = cursor.fetchone()
             
     if not user:
@@ -1759,9 +1853,9 @@ def approve_user(
                 """
                 UPDATE users 
                 SET approval_status = 'Approved', role = 'User', profile_image = %s 
-                WHERE id = %s
+                WHERE id = %s AND organization_id = %s
                 """,
-                (new_profile_path, user_id)
+                (new_profile_path, user_id, org_id)
             )
             
     # Write audit log
@@ -1782,13 +1876,14 @@ def reject_user(
     
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id FROM users WHERE id = %s", (user_id,))
+            org_id = current_user.get("organization_id", 1)
+            cursor.execute("SELECT id FROM users WHERE id = %s AND organization_id = %s", (user_id, org_id))
             if not cursor.fetchone():
                 raise HTTPException(status_code=404, detail="User not found.")
                 
             cursor.execute(
-                "UPDATE users SET approval_status = 'Rejected' WHERE id = %s",
-                (user_id,)
+                "UPDATE users SET approval_status = 'Rejected' WHERE id = %s AND organization_id = %s",
+                (user_id, org_id)
             )
             
     audit_service.log_audit_action(current_user["user_id"], "Reject User", user_id)
@@ -1815,7 +1910,8 @@ def modify_user_role(
         
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id, name, profile_image FROM users WHERE id = %s", (user_id,))
+            org_id = current_user.get("organization_id", 1)
+            cursor.execute("SELECT id, name, profile_image FROM users WHERE id = %s AND organization_id = %s", (user_id, org_id))
             user = cursor.fetchone()
             
     if not user:
@@ -1852,7 +1948,7 @@ def modify_user_role(
         dest_folder = config.REGISTERED_DIR
         
     # Enforce permission checks: only super admin can make admins or super admins
-    if target_role in ["Admin", "Super_Admin"] and current_role != "Super_Admin":
+    if target_role in ["Admin", "Super_Admin"] and current_role != "super_admin":
         raise HTTPException(status_code=403, detail="Permission denied. Only super admin can make admins or super admins.")
         
     # Move profile image to the appropriate folder structure
@@ -1877,9 +1973,9 @@ def modify_user_role(
                 """
                 UPDATE users 
                 SET role = %s, approval_status = %s, profile_image = %s 
-                WHERE id = %s
+                WHERE id = %s AND organization_id = %s
                 """,
-                (target_role, target_status, new_profile_image, user_id)
+                (target_role, target_status, new_profile_image, user_id, org_id)
             )
             
     # Write audit log
@@ -1906,7 +2002,8 @@ def remove_user(
     
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id, name, profile_image FROM users WHERE id = %s", (user_id,))
+            org_id = current_user.get("organization_id", 1)
+            cursor.execute("SELECT id, name, profile_image FROM users WHERE id = %s AND organization_id = %s", (user_id, org_id))
             user = cursor.fetchone()
             
     if not user:
@@ -1932,7 +2029,7 @@ def remove_user(
     # Delete from database (Cascade will automatically remove attendance and embeddings records)
     with get_db() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+            cursor.execute("DELETE FROM users WHERE id = %s AND organization_id = %s", (user_id, org_id))
             
     # Log admin audit action
     audit_service.log_audit_action(current_user["user_id"], "Remove User Permanently", user_id)
@@ -2230,7 +2327,7 @@ async def detect_objects(image: UploadFile = File(...)):
                         "confidence": conf,
                         "warning": True
                     })
-                    warnings.append(f"⚠️ Animal detected: {class_name.upper()} (confidence: {conf:.2f})")
+                    warnings.append(f"âš ï¸ Animal detected: {class_name.upper()} (confidence: {conf:.2f})")
                     
                     # Log to DB
                     with get_db() as conn:
@@ -2251,7 +2348,7 @@ async def detect_objects(image: UploadFile = File(...)):
                         "confidence": conf,
                         "warning": True
                     })
-                    warnings.append(f"🚨 WEAPON detected: {class_name.upper()} (confidence: {conf:.2f})")
+                    warnings.append(f"ðŸš¨ WEAPON detected: {class_name.upper()} (confidence: {conf:.2f})")
                     
                     # Log to DB
                     with get_db() as conn:
@@ -2585,19 +2682,17 @@ def get_attendance_overview(
             # 6. Top 10 attendance rankings this month (all approved users, sorted by pct desc)
             cursor.execute(
                 """
-                select *
-                from (select *
-                      from (SELECT u.id,
-                                   u.name,
-                                   u.department,
-                                   u.role,
-                                   SUM(CASE WHEN a.status IN ('Present', 'Half Day') THEN 1 ELSE 0 END) AS present_days,
-                                   SUM(CASE WHEN a.status = 'Late' THEN 1 ELSE 0 END)                   AS late_days
-                            FROM users u
-                                     LEFT JOIN attendance a
-                                               ON u.id = a.user_id
-                                                   AND MONTH () ua a.attendance_date)) "ua*" = MONTH (CURRENT_DATE ())
-                    AND YEAR (a.attendance_date) = YEAR (CURRENT_DATE ())
+                SELECT u.id,
+                       u.name,
+                       u.department,
+                       u.role,
+                       SUM(CASE WHEN a.status IN ('Present', 'Half Day') THEN 1 ELSE 0 END) AS present_days,
+                       SUM(CASE WHEN a.status = 'Late' THEN 1 ELSE 0 END)                   AS late_days
+                FROM users u
+                         LEFT JOIN attendance a
+                                   ON u.id = a.user_id
+                                       AND MONTH(a.attendance_date) = MONTH(CURRENT_DATE())
+                                       AND YEAR(a.attendance_date) = YEAR(CURRENT_DATE())
                 WHERE u.approval_status = 'Approved'
                 GROUP BY u.id, u.name, u.department, u.role
                 """
@@ -2612,7 +2707,7 @@ def get_attendance_overview(
                     att_pct = round(min(100.0, ((pdays + ldays) / workdays_so_far) * 100.0), 1)
                 else:
                     att_pct = 0.0
-                dept = tr["department"] or ("Administration" if tr["role"] in ["Admin", "Super_Admin", "Developer"] else "—")
+                dept = tr["department"] or ("Administration" if tr["role"] in ["Admin", "Super_Admin", "Developer"] else "â€”")
                 top_attendance.append({
                     "name":          tr["name"],
                     "department":    dept,
@@ -2861,11 +2956,11 @@ def get_attendance_report(date_str: str, current_user: Dict[str, Any] = Depends(
     return report_board
 
 
-# ─── COMMENT ENDPOINTS ────────────────────────────────────────────────────────
+# â”€â”€â”€ COMMENT ENDPOINTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.get("/comments")
-def get_comments():
-    """Return all comments, latest first. Public – no auth required."""
+def get_comments(current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)):
+    """Return all comments, latest first. Public â€“ no auth required."""
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -2891,7 +2986,7 @@ class CommentPayload(BaseModel):
     comment_text: str
 
 @app.post("/comments")
-def post_comment(payload: CommentPayload):
+def post_comment(payload: CommentPayload, current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)):
     """Save a new comment. Open to any visitor (no token required)."""
     text = payload.comment_text.strip()
     if not text:
@@ -2928,88 +3023,9 @@ def delete_comment(
     return {"status": "ok", "message": "Comment deleted."}
 
 
-# ─── ENTERPRISE GEOFENCE MANAGEMENT ENDPOINTS ──────────────────────────────────
-
-class GeoFencePayload(BaseModel):
-    location_name: str
-    latitude: float
-    longitude: float
-    radius_meters: float
-    is_active: bool = True
-
-@app.get("/admin/geofences")
-def get_geofences(current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)):
-    """Fetch all configured geofences. Super admin only."""
-    auth_service.check_role(current_user, ["Super_Admin"])
-    return geofence_service.list_all_geo_fences()
-
-@app.post("/admin/geofences")
-def create_geofence(
-    payload: GeoFencePayload,
-    current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)
-):
-    """Add a new geo fence. Super admin only."""
-    auth_service.check_role(current_user, ["Super_Admin"])
-    fence_id = geofence_service.add_geo_fence(
-        payload.location_name,
-        payload.latitude,
-        payload.longitude,
-        payload.radius_meters,
-        payload.is_active
-    )
-    if not fence_id:
-        raise HTTPException(status_code=500, detail="Failed to create geofence.")
-        
-    audit_service.log_audit_action(
-        current_user["user_id"], 
-        f"Created Geo Fence: {payload.location_name} (radius: {payload.radius_meters}m)"
-    )
-    return {"status": "ok", "id": fence_id, "message": "Geofence created successfully."}
-
-@app.put("/admin/geofences/{fence_id}")
-def update_geofence(
-    fence_id: int,
-    payload: GeoFencePayload,
-    current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)
-):
-    """Edit an existing geo fence. Super admin only."""
-    auth_service.check_role(current_user, ["Super_Admin"])
-    success = geofence_service.update_geo_fence(
-        fence_id,
-        payload.location_name,
-        payload.latitude,
-        payload.longitude,
-        payload.radius_meters,
-        payload.is_active
-    )
-    if not success:
-        raise HTTPException(status_code=404, detail="Geofence not found or not modified.")
-        
-    audit_service.log_audit_action(
-        current_user["user_id"], 
-        f"Updated Geo Fence ID {fence_id}: {payload.location_name}"
-    )
-    return {"status": "ok", "message": "Geofence updated successfully."}
-
-@app.delete("/admin/geofences/{fence_id}")
-def delete_geofence(
-    fence_id: int,
-    current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials)
-):
-    """Delete a geo fence. Super admin only."""
-    auth_service.check_role(current_user, ["Super_Admin"])
-    success = geofence_service.delete_geo_fence(fence_id)
-    if not success:
-        raise HTTPException(status_code=404, detail="Geofence not found.")
-        
-    audit_service.log_audit_action(
-        current_user["user_id"], 
-        f"Deleted Geo Fence ID {fence_id}"
-    )
-    return {"status": "ok", "message": "Geofence deleted successfully."}
 
 
-# ─── ENTERPRISE REPORTING ENDPOINTS ───────────────────────────────────────────
+# â”€â”€â”€ ENTERPRISE REPORTING ENDPOINTS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 @app.get("/admin/reports")
 def get_reports(
@@ -3023,6 +3039,7 @@ def get_reports(
     """Retrieve master attendance data based on filters. Admin only."""
     auth_service.check_role(current_user, ["Admin", "Super_Admin", "Developer"])
     return report_service.get_report_data(
+        organization_id=current_user.get("organization_id", 1),
         selected_date=date,
         selected_month=month,
         selected_year=year,
@@ -3042,6 +3059,7 @@ def get_reports_pdf(
     """Generate and download a professional PDF report. Admin only."""
     auth_service.check_role(current_user, ["Admin", "Super_Admin", "Developer"])
     records = report_service.get_report_data(
+        organization_id=current_user.get("organization_id", 1),
         selected_date=date,
         selected_month=month,
         selected_year=year,
@@ -3089,3 +3107,206 @@ def webauthn_authenticate_challenge():
         "challenge": challenge,
         "rp_id": config.WEBAUTHN_RP_ID,
     }
+
+# --- SHIFT & LEAVE MODELS ---
+class CreateShiftPayload(BaseModel):
+    name: str
+    start_time: str
+    end_time: str
+    grace_period_minutes: int
+
+class AssignShiftPayload(BaseModel):
+    user_id: int
+    shift_id: int
+
+class RequestLeavePayload(BaseModel):
+    leave_type_id: int
+    start_date: str
+    end_date: str
+    reason: str
+
+class ReviewLeavePayload(BaseModel):
+    status: str
+
+# --- SHIFT API ---
+@app.post("/admin/shifts")
+def create_shift(payload: CreateShiftPayload, current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials), org_id: int = Depends(get_current_organization)):
+    auth_service.check_role(current_user, ["Super_Admin"])
+    shift_id = shift_service.create_shift(
+        org_id, payload.name, payload.start_time, payload.end_time, payload.grace_period_minutes
+    )
+    return {"success": True, "shift_id": shift_id}
+
+@app.get("/admin/shifts")
+def get_shifts(current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials), org_id: int = Depends(get_current_organization)):
+    auth_service.check_role(current_user, ["Admin", "Super_Admin"])
+    return shift_service.get_shifts(org_id)
+
+@app.post("/admin/shifts/assign")
+def assign_shift(payload: AssignShiftPayload, current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials), org_id: int = Depends(get_current_organization)):
+    auth_service.check_role(current_user, ["Super_Admin"])
+    success = shift_service.assign_shift_to_user(payload.user_id, payload.shift_id, org_id)
+    if not success:
+        raise HTTPException(status_code=400, detail="Failed to assign shift")
+    return {"success": True}
+
+# --- LEAVE API ---
+@app.post("/leave/request")
+def submit_leave_request(payload: RequestLeavePayload, current_user: dict = Depends(auth_service.get_current_user_from_credentials)):
+    user_id = current_user.get("id") or current_user.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    req_id = leave_service.request_leave(
+        user_id, payload.leave_type_id, payload.start_date, payload.end_date, payload.reason
+    )
+    return {"success": True, "request_id": req_id}
+
+@app.get("/leave/my-requests")
+def get_my_leave_requests(current_user: dict = Depends(auth_service.get_current_user_from_credentials)):
+    user_id = current_user.get("id") or current_user.get("user_id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return leave_service.get_my_leave_requests(user_id)
+
+@app.get("/admin/leaves/pending")
+def get_pending_leaves(current_user: dict = Depends(auth_service.get_current_user_from_credentials), org_id: int = Depends(get_current_organization)):
+    auth_service.check_role(current_user, ["Admin", "Super_Admin"])
+    return leave_service.get_pending_leave_requests(org_id)
+
+@app.post("/admin/leaves/{request_id}/review")
+def review_leave_request(request_id: int, payload: ReviewLeavePayload, current_user: dict = Depends(auth_service.get_current_user_from_credentials), org_id: int = Depends(get_current_organization)):
+    auth_service.check_role(current_user, ["Admin", "Super_Admin"])
+    admin_id = current_user.get("id") or current_user.get("user_id")
+    success = leave_service.review_leave_request(request_id, org_id, admin_id, payload.status)
+    if not success:
+        raise HTTPException(status_code=400, detail="Failed to review leave request")
+    return {"success": True}
+
+
+
+
+# ==============================================================================
+# VISITOR MANAGEMENT ENDPOINTS (Phase 9)
+# ==============================================================================
+from pydantic import BaseModel
+from typing import Optional
+from backend.services import visitor_service, alert_service
+
+class RegisterVisitorPayload(BaseModel):
+    host_user_id: int
+    full_name: str
+    purpose: str
+    expected_arrival: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    company: Optional[str] = None
+    notes: Optional[str] = None
+
+@app.post("/visitors/register")
+def register_visitor(payload: RegisterVisitorPayload, current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials), org_id: int = Depends(get_current_organization)):
+    # Any authenticated user can register a visitor
+    try:
+        res = visitor_service.register_visitor(
+            organization_id=org_id,
+            host_user_id=payload.host_user_id,
+            created_by=current_user["user_id"],
+            full_name=payload.full_name,
+            purpose=payload.purpose,
+            expected_arrival=payload.expected_arrival,
+            email=payload.email,
+            phone=payload.phone,
+            company=payload.company,
+            notes=payload.notes
+        )
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/visitors")
+def get_visitors(status: Optional[str] = None, current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials), org_id: int = Depends(get_current_organization)):
+    try:
+        visits = visitor_service.get_visits_for_organization(org_id, status)
+        return visits
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class ReviewVisitorPayload(BaseModel):
+    status: str # 'approved' or 'rejected'
+
+@app.post("/visitors/{visit_id}/review")
+def review_visit(visit_id: int, payload: ReviewVisitorPayload, current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials), org_id: int = Depends(get_current_organization)):
+    try:
+        res = visitor_service.approve_visit(
+            visit_id=visit_id,
+            host_user_id=current_user["user_id"],
+            organization_id=org_id,
+            status=payload.status
+        )
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class CheckInVisitorPayload(BaseModel):
+    qr_token: str
+
+@app.post("/visitors/check-in")
+def check_in_visitor(payload: CheckInVisitorPayload, current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials), org_id: int = Depends(get_current_organization)):
+    try:
+        res = visitor_service.check_in_visitor(payload.qr_token, org_id)
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==============================================================================
+# IN-APP ALERTS ENDPOINTS (Phase 10)
+# ==============================================================================
+
+@app.get("/alerts")
+def get_alerts(unread_only: bool = False, current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials), org_id: int = Depends(get_current_organization)):
+    try:
+        alerts = alert_service.get_user_alerts(
+            user_id=current_user["user_id"],
+            organization_id=org_id,
+            unread_only=unread_only
+        )
+        return alerts
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/alerts/{alert_id}/read")
+def mark_alert_read(alert_id: int, current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials), org_id: int = Depends(get_current_organization)):
+    try:
+        success = alert_service.mark_alert_read(
+            alert_id=alert_id,
+            user_id=current_user["user_id"],
+            organization_id=org_id
+        )
+        return {"success": success}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==============================================================================
+# AI ANALYTICS ENDPOINTS (Phase 11)
+# ==============================================================================
+
+from backend.services.analytics_service import AnalyticsService
+
+@app.get("/analytics/dashboard")
+def get_analytics_dashboard(
+    days: int = 30, 
+    current_user: Dict[str, Any] = Depends(auth_service.get_current_user_from_credentials), 
+    org_id: int = Depends(get_current_organization)
+):
+    try:
+        # Check permissions (only admins/owners should see this)
+        role = current_user.get("role", "Guest")
+        if role not in ["Admin", "Organization_Admin", "Organization_Owner", "Platform_Super_Admin"]:
+            raise HTTPException(status_code=403, detail="Not authorized to view analytics.")
+            
+        metrics = AnalyticsService.get_dashboard_metrics(organization_id=org_id, days=days)
+        return metrics
+    except Exception as e:
+        logger.error(f"Error generating analytics dashboard: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+

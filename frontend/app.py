@@ -6,13 +6,21 @@ import pandas as pd
 from datetime import datetime, timedelta
 from PIL import Image
 from utils.api_client import FaceAiApiClient
+from utils.theme import apply_global_theme, render_theme_toggle, get_plotly_theme
 import base64
 from io import BytesIO
 from pathlib import Path
 import logging
 import os
-from pages.geo_settings import render_geo_settings
+import folium
+from streamlit_folium import st_folium
+
 from pages.reports import render_reports_page
+# from pages.organization import render_organization_dashboard
+# from pages.shifts import show_shifts_dashboard
+# from pages.leaves import show_leave_dashboard
+# from pages.visitors import render_visitor_management
+# from pages.analytics import render_analytics_dashboard
 from modules.auth import render_login_section, render_register_section, render_face_enrollment_section
 from modules.scanner import render_scanner_section
 st.set_page_config(
@@ -54,10 +62,6 @@ def reset_auth_session():
     st.session_state.registration_step = "form"
     st.session_state.captcha_data = None
     st.session_state.cooldowns = {}
-    st.session_state.location_checked = False
-    st.session_state.latitude = None
-    st.session_state.longitude = None
-    st.session_state.location_denied = False
     st.session_state.fingerprint_scanning = False
     st.session_state.fingerprint_verified = False
     st.session_state.attendance_marked = False
@@ -68,15 +72,6 @@ def reset_auth_session():
     st.session_state._need_clear_cookies = True
     st.session_state._need_save_cookies = False
 
-def get_api():
-    backend_url = os.getenv(
-        "BACKEND_URL",
-        "http://127.0.0.1:8000"
-    )
-
-    return FaceAiApiClient(
-        base_url=backend_url
-    )
 
 def logout():
     reset_auth_session()
@@ -260,17 +255,9 @@ if "user" not in st.session_state:
 if "token" not in st.session_state:
     st.session_state.token = None
 
-# Safe defaults for scanner state, cooldowns, location, and fingerprint verified statuses
+# Safe defaults for scanner state, cooldowns, and fingerprint verified statuses
 if "cooldowns" not in st.session_state:
     st.session_state.cooldowns = {}
-if "location_checked" not in st.session_state:
-    st.session_state.location_checked = False
-if "latitude" not in st.session_state:
-    st.session_state.latitude = None
-if "longitude" not in st.session_state:
-    st.session_state.longitude = None
-if "location_denied" not in st.session_state:
-    st.session_state.location_denied = False
 if "fingerprint_scanning" not in st.session_state:
     st.session_state.fingerprint_scanning = False
 if "fingerprint_verified" not in st.session_state:
@@ -336,121 +323,7 @@ if st.session_state.get("logged_out"):
     st.session_state._need_clear_cookies = True
     st.session_state._need_save_cookies = False
 
-# Background silent Geolocation capture
-if "location_checked" not in st.session_state:
-    st.session_state.location_checked = False
-if "latitude" not in st.session_state:
-    st.session_state.latitude = None
-if "longitude" not in st.session_state:
-    st.session_state.longitude = None
-if "location_denied" not in st.session_state:
-    st.session_state.location_denied = False
 
-if not st.session_state.location_checked:
-    lat_q = st.query_params.get("lat")
-    lon_q = st.query_params.get("lon")
-    if lat_q and lon_q:
-        st.session_state.latitude = float(lat_q)
-        st.session_state.longitude = float(lon_q)
-        st.session_state.location_checked = True
-        st.session_state.location_denied = False
-        st.query_params.clear()
-        st.rerun()
-    else:
-        err_q = st.query_params.get("loc_err")
-        if err_q:
-            st.session_state.latitude = None
-            st.session_state.longitude = None
-            st.session_state.location_denied = True
-            st.session_state.location_checked = True
-            st.query_params.clear()
-            st.rerun()
-        else:
-            # Inject silent geolocation script in the background
-            st.components.v1.html(
-                """
-                <script>
-                const cacheKey = "face_ai_geo_cache";
-                const now = Date.now();
-                let cached = null;
-                try {
-                    cached = JSON.parse(localStorage.getItem(cacheKey));
-                } catch(e) {}
-
-                // Only use cache if it is fresh (2 minutes) and has valid non-zero coords
-                const cacheFresh = cached && (now - cached.timestamp < 120000)
-                    && cached.lat !== 0 && cached.lon !== 0;
-
-                if (cacheFresh) {
-                    try {
-                        const url = new URL(window.parent.location.href);
-                        url.searchParams.set("lat", cached.lat);
-                        url.searchParams.set("lon", cached.lon);
-                        window.parent.location.href = url.href;
-                    } catch(e) {
-                        const parentUrl = document.referrer || window.location.href;
-                        const url = new URL(parentUrl);
-                        url.searchParams.set("lat", cached.lat);
-                        url.searchParams.set("lon", cached.lon);
-                        const a = document.createElement('a');
-                        a.href = url.href;
-                        a.target = '_parent';
-                        document.body.appendChild(a);
-                        a.click();
-                    }
-                } else {
-                    navigator.geolocation.getCurrentPosition(
-                         function(position) {
-                             const lat = position.coords.latitude;
-                             const lon = position.coords.longitude;
-                             try {
-                                 localStorage.setItem(cacheKey, JSON.stringify({
-                                     lat: lat,
-                                     lon: lon,
-                                     timestamp: Date.now()
-                                 }));
-                             } catch(e) {}
-                             try {
-                                 const url = new URL(window.parent.location.href);
-                                 url.searchParams.set("lat", lat);
-                                 url.searchParams.set("lon", lon);
-                                 window.parent.location.href = url.href;
-                             } catch(e) {
-                                 const parentUrl = document.referrer || window.location.href;
-                                 const url = new URL(parentUrl);
-                                 url.searchParams.set("lat", lat);
-                                 url.searchParams.set("lon", lon);
-                                 const a = document.createElement('a');
-                                 a.href = url.href;
-                                 a.target = '_parent';
-                                 document.body.appendChild(a);
-                                 a.click();
-                             }
-                         },
-                         function(error) {
-                             console.error("GPS Error: " + error.message);
-                             try {
-                                 const url = new URL(window.parent.location.href);
-                                 url.searchParams.set("loc_err", "true");
-                                 window.parent.location.href = url.href;
-                             } catch(e) {
-                                 const parentUrl = document.referrer || window.location.href;
-                                 const url = new URL(parentUrl);
-                                 url.searchParams.set("loc_err", "true");
-                                 const a = document.createElement('a');
-                                 a.href = url.href;
-                                 a.target = '_parent';
-                                 document.body.appendChild(a);
-                                 a.click();
-                             }
-                         },
-                        { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
-                    );
-                }
-                </script>
-                """,
-                height=1
-            )
 
 # Session Inactivity Timeout (15 minutes = 900 seconds)
 if st.session_state.get("authenticated") and st.session_state.get("user_id"):
@@ -551,710 +424,7 @@ if "nav" in st.query_params:
 
 
 def inject_css():
-    st.markdown("""<style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-    
-    html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif !important;
-        background-color: #F8FAFC !important;
-        color: #1F2937 !important;
-    }
-    
-    /* Hide standard Streamlit header and decorations */
-    header[data-testid="stHeader"] {
-        display: none !important;
-    }
-    div[data-testid="stDecoration"] {
-        display: none !important;
-    }
-    .stApp,
-    [data-testid="stAppViewContainer"],
-    [data-testid="stHeader"],
-    .main,
-    .stMain,
-    .stAppViewContainer,
-    div[data-testid="stAppViewBlockContainer"] {
-        background-color: #F8FAFC !important;
-        background-image: none !important;
-        color: #1F2937 !important;
-        padding-top: 0 !important;
-    }
-    
-    /* Global Card Base Class (Stripe, Linear, Clerk quality) */
-    .saas-card {
-        background-color: #FFFFFF !important;
-        border: 1px solid #E5E7EB !important;
-        border-radius: 24px !important;
-        padding: 2.5rem !important;
-        box-shadow: 0 12px 35px rgba(15, 23, 42, 0.08) !important;
-        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1) !important;
-        height: 100%;
-        box-sizing: border-box;
-    }
-    .saas-card:hover {
-        transform: translateY(-5px);
-        box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.05), 0 10px 10px -5px rgba(0, 0, 0, 0.03) !important;
-        border-color: #D1D5DB !important;
-    }
-    
-    /* Sticky Navbar glassmorphism */
-    .custom-navbar {
-        border-radius: 50px !important;
-        padding: 0.6rem 2rem !important;
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 1rem;
-        width: 100%;
-        margin-top: 1rem;
-        margin-bottom: 2.5rem;
-        position: sticky;
-        top: 10px;
-        z-index: 1000;
-        height: 80px;
-        box-sizing: border-box;
-        transition: all 0.3s ease;
-    }
-    
-    /* Navbar Light style */
-    .custom-navbar.navbar-light {
-        background: rgba(255, 255, 255, 0.75) !important;
-        backdrop-filter: blur(12px) !important;
-        -webkit-backdrop-filter: blur(12px) !important;
-        border: 1px solid rgba(229, 231, 235, 0.7) !important;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.03) !important;
-    }
-    .custom-navbar.navbar-light .logo-title {
-        color: #1F2937 !important;
-    }
-    .custom-navbar.navbar-light .logo-subtitle {
-        color: #64748B !important;
-    }
-    .custom-navbar.navbar-light .logo-svg path {
-        stroke: #2563EB !important;
-    }
-    .custom-navbar.navbar-light .logo-svg path[fill] {
-        fill: #2563EB !important;
-    }
-    .custom-navbar.navbar-light button {
-        color: #4B5563 !important;
-        background-color: transparent;
-        border: none;
-        font-weight: 600;
-        font-size: 0.9rem;
-        padding: 0.5rem 1.2rem;
-        border-radius: 30px;
-        cursor: pointer;
-        transition: all 0.2s ease;
-    }
-    .custom-navbar.navbar-light button:hover {
-        color: #2563EB !important;
-        background-color: rgba(37, 99, 235, 0.05) !important;
-    }
-    .custom-navbar.navbar-light button.active {
-        background-color: rgba(37, 99, 235, 0.1) !important;
-        color: #2563EB !important;
-        box-shadow: none !important;
-    }
-    .custom-navbar.navbar-light .nav-login-btn {
-        color: #4B5563 !important;
-        font-weight: 600;
-        text-decoration: none;
-        font-size: 0.9rem;
-        padding: 0.5rem 1.2rem;
-        transition: all 0.2s ease;
-    }
-    .custom-navbar.navbar-light .nav-login-btn:hover {
-        color: #2563EB !important;
-    }
-    .custom-navbar.navbar-light .nav-register-btn {
-        background-color: #2563EB !important;
-        color: #FFFFFF !important;
-        border: 1px solid #2563EB !important;
-        padding: 0.5rem 1.5rem;
-        border-radius: 30px;
-        font-weight: 600;
-        font-size: 0.9rem;
-        cursor: pointer;
-        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2) !important;
-        transition: all 0.2s ease;
-        text-decoration: none;
-    }
-    .custom-navbar.navbar-light .nav-register-btn:hover {
-        background-color: #1D4ED8 !important;
-        border-color: #1D4ED8 !important;
-        transform: translateY(-1px);
-    }
-
-    /* Navbar Dark style */
-    .custom-navbar.navbar-dark {
-        background: rgba(255, 255, 255, 0.08) !important;
-        backdrop-filter: blur(16px) !important;
-        -webkit-backdrop-filter: blur(16px) !important;
-        border: 1px solid rgba(255, 255, 255, 0.15) !important;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1) !important;
-    }
-    .custom-navbar.navbar-dark .logo-title {
-        color: #FFFFFF !important;
-    }
-    .custom-navbar.navbar-dark .logo-subtitle {
-        color: #93C5FD !important;
-    }
-    .custom-navbar.navbar-dark .logo-svg path {
-        stroke: #FFFFFF !important;
-    }
-    .custom-navbar.navbar-dark .logo-svg path[fill] {
-        fill: #FFFFFF !important;
-    }
-    .custom-navbar.navbar-dark button {
-        color: rgba(255, 255, 255, 0.8) !important;
-        background-color: transparent;
-        border: none;
-        font-weight: 600;
-        font-size: 0.9rem;
-        padding: 0.5rem 1.2rem;
-        border-radius: 30px;
-        cursor: pointer;
-        transition: all 0.2s ease;
-    }
-    .custom-navbar.navbar-dark button:hover {
-        color: #FFFFFF !important;
-        background-color: rgba(255, 255, 255, 0.1) !important;
-    }
-    .custom-navbar.navbar-dark button.active {
-        background-color: #2563EB !important;
-        color: #FFFFFF !important;
-        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25) !important;
-    }
-    .custom-navbar.navbar-dark .nav-login-btn {
-        color: rgba(255, 255, 255, 0.9) !important;
-        font-weight: 600;
-        text-decoration: none;
-        font-size: 0.9rem;
-        padding: 0.5rem 1.2rem;
-        transition: all 0.2s ease;
-    }
-    .custom-navbar.navbar-dark .nav-login-btn:hover {
-        color: #FFFFFF !important;
-    }
-    .custom-navbar.navbar-dark .nav-register-btn {
-        background-color: #2563EB !important;
-        color: #FFFFFF !important;
-        border: 1px solid #2563EB !important;
-        padding: 0.5rem 1.5rem;
-        border-radius: 30px;
-        font-weight: 600;
-        font-size: 0.9rem;
-        cursor: pointer;
-        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2) !important;
-        transition: all 0.2s ease;
-        text-decoration: none;
-    }
-    .custom-navbar.navbar-dark .nav-register-btn:hover {
-        background-color: #1D4ED8 !important;
-        border-color: #1D4ED8 !important;
-        transform: translateY(-1px);
-    }
-    
-    /* Hero Banner Section */
-    .hero-section {
-        background: linear-gradient(135deg, #2563EB 0%, #1D4ED8 100%) !important;
-        border-radius: 24px !important;
-        padding: 7rem 4rem 4.5rem 4rem !important;
-        color: #FFFFFF !important;
-        margin-top: -112px !important;
-        margin-bottom: 2.5rem !important;
-        position: relative;
-        overflow: hidden;
-        box-shadow: 0 20px 40px rgba(37, 99, 235, 0.12) !important;
-        z-index: 1;
-    }
-    .hero-content {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 2rem;
-        position: relative;
-        z-index: 2;
-    }
-    .hero-left {
-        flex: 1.3;
-    }
-    .hero-title {
-        font-family: 'Inter', sans-serif !important;
-        font-weight: 800 !important;
-        font-size: 3.5rem !important;
-        line-height: 1.15 !important;
-        color: #FFFFFF !important;
-        margin-top: 0 !important;
-        margin-bottom: 1.2rem !important;
-        text-align: left !important;
-    }
-    .hero-subtitle {
-        font-size: 1.25rem !important;
-        opacity: 0.9;
-        margin-bottom: 2rem !important;
-        line-height: 1.6 !important;
-        max-width: 550px;
-        text-align: left !important;
-    }
-    .hero-badges {
-        display: flex;
-        gap: 0.75rem;
-        flex-wrap: wrap;
-        margin-bottom: 2rem;
-    }
-    .hero-badge {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.5rem 1rem !important;
-        border-radius: 50px !important;
-        font-size: 0.85rem !important;
-        font-weight: 600 !important;
-        background: #FFFFFF !important;
-        color: #1F2937 !important;
-        border: none !important;
-    }
-    .hero-badge-check {
-        color: #10B981 !important;
-        font-weight: bold;
-    }
-    .hero-right {
-        flex: 0.7;
-        display: flex;
-        justify-content: center;
-        align-items: center;
-    }
-    
-    /* Face Recognition HUD Illustration */
-    .face-scan-container {
-        width: 280px;
-        height: 280px;
-        position: relative;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    }
-    .scanning-ring {
-        position: absolute;
-        width: 280px;
-        height: 280px;
-        border: 3px solid rgba(96, 165, 250, 0.4);
-        border-radius: 50%;
-        border-top-color: transparent;
-        border-bottom-color: transparent;
-        animation: spin 8s linear infinite;
-        opacity: 0.7;
-    }
-    @keyframes spin {
-        0% { transform: rotate(0deg); }
-        100% { transform: rotate(360deg); }
-    }
-    .face-mesh {
-        width: 170px;
-        height: 170px;
-        position: relative;
-        opacity: 0.95;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    }
-    .verification-checkmark {
-        position: absolute;
-        bottom: 10px;
-        right: 10px;
-        background: #10B981;
-        color: white;
-        width: 36px;
-        height: 36px;
-        border-radius: 50%;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-weight: bold;
-        box-shadow: 0 4px 12px rgba(16, 185, 129, 0.4);
-        font-size: 1.25rem;
-    }
-    
-    /* Circular scan animations */
-    .scan-circle-wrapper {
-        position: relative;
-        width: 200px;
-        height: 200px;
-        margin: 0 auto 2.5rem auto;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-    }
-    .scan-circle-ring-1 {
-        position: absolute;
-        width: 100%;
-        height: 100%;
-        border-radius: 50%;
-        background: rgba(37, 99, 235, 0.04);
-        animation: pulse-ring 3s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
-    }
-    .scan-circle-ring-2 {
-        position: absolute;
-        width: 80%;
-        height: 80%;
-        border-radius: 50%;
-        background: rgba(37, 99, 235, 0.07);
-        animation: pulse-ring-delayed 3s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
-    }
-    .scan-circle-center {
-        position: relative;
-        z-index: 2;
-        width: 100px;
-        height: 100px;
-        border-radius: 50%;
-        background: #2563EB;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        box-shadow: 0 10px 30px rgba(37, 99, 235, 0.35);
-    }
-    @keyframes pulse-ring {
-        0% { transform: scale(0.6); opacity: 0; }
-        50% { opacity: 0.5; }
-        100% { transform: scale(1.1); opacity: 0; }
-    }
-    @keyframes pulse-ring-delayed {
-        0% { transform: scale(0.4); opacity: 0; }
-        50% { opacity: 0.8; }
-        100% { transform: scale(1.0); opacity: 0; }
-    }
-    
-    /* Rules Card Styles */
-    .rules-header {
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-        border-bottom: 1px solid #F1F5F9;
-        padding-bottom: 1.2rem;
-        margin-bottom: 2rem;
-    }
-    .rules-header h3 {
-        font-family: 'Inter', sans-serif !important;
-        font-weight: 700 !important;
-        color: #1F2937 !important;
-        font-size: 1.4rem !important;
-        margin: 0 !important;
-        text-align: left !important;
-    }
-    .rule-item {
-        display: flex;
-        align-items: center;
-        gap: 1.25rem;
-        margin-bottom: 1.8rem;
-    }
-    .rule-badge {
-        width: 44px;
-        height: 44px;
-        border-radius: 12px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        flex-shrink: 0;
-    }
-    .badge-green {
-        background-color: rgba(16, 185, 129, 0.1);
-        color: #10B981;
-    }
-    .badge-blue {
-        background-color: rgba(37, 99, 235, 0.1);
-        color: #2563EB;
-    }
-    .badge-orange {
-        background-color: rgba(245, 158, 11, 0.1);
-        color: #F59E0B;
-    }
-    .rule-text h4 {
-        font-weight: 700 !important;
-        font-size: 1.05rem !important;
-        color: #1F2937 !important;
-        margin: 0 0 0.25rem 0 !important;
-        text-align: left !important;
-    }
-    .rule-text p {
-        font-size: 0.9rem !important;
-        color: #64748B !important;
-        margin: 0 !important;
-        line-height: 1.4 !important;
-    }
-    
-    /* Core Admin KPI and Profile Metrics styles */
-    .metric-card {
-        background-color: #FFFFFF !important;
-        padding: 1.8rem !important;
-        border-radius: 24px !important;
-        border: 1px solid #E5E7EB !important;
-        box-shadow: 0 12px 35px rgba(15, 23, 42, 0.08) !important;
-        margin-bottom: 1rem !important;
-        text-align: center;
-        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    }
-    .metric-card:hover {
-        transform: translateY(-4px);
-        box-shadow: 0 15px 25px rgba(0, 0, 0, 0.05) !important;
-        border-color: #D1D5DB !important;
-    }
-    .stat-number {
-        font-family: 'Inter', sans-serif !important;
-        font-size: 2.5rem !important;
-        font-weight: 800 !important;
-        color: #2563EB !important;
-        margin: 0 0 6px 0 !important;
-    }
-    .stat-label {
-        font-family: 'Inter', sans-serif !important;
-        font-size: 0.95rem !important;
-        color: #1F2937 !important;
-        font-weight: 600 !important;
-        margin: 0 0 4px 0 !important;
-    }
-    .stat-sublabel {
-        font-family: 'Inter', sans-serif !important;
-        font-size: 0.8rem !important;
-        color: #64748B !important;
-        margin: 0 !important;
-    }
-    
-    /* Content Box generic */
-    .content-box {
-        background-color: #FFFFFF !important;
-        padding: 2.2rem !important;
-        border-radius: 24px !important;
-        border: 1px solid #E5E7EB !important;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.02) !important;
-        margin-bottom: 1.5rem !important;
-        color: #1F2937 !important;
-        transition: all 0.3s ease;
-    }
-    .content-box:hover {
-        transform: translateY(-5px);
-        box-shadow: 0 15px 35px rgba(0, 0, 0, 0.04) !important;
-    }
-    
-    /* Input elements style override */
-    div[data-baseweb="input"] {
-        background-color: #FFFFFF !important;
-        border: 1px solid #E5E7EB !important;
-        border-radius: 12px !important;
-        padding: 0.2rem 0.5rem !important;
-    }
-    div[data-baseweb="input"] input {
-        color: #1F2937 !important;
-        -webkit-text-fill-color: #1F2937 !important;
-        font-size: 0.95rem !important;
-    }
-    div[data-baseweb="input"]:focus-within {
-        border-color: #2563EB !important;
-        box-shadow: 0 0 0 1px #2563EB !important;
-    }
-    
-    /* Custom style targeting start/stop button specifically */
-    .custom-action-btn div.stButton > button {
-        background: #2563EB !important;
-        color: #FFFFFF !important;
-        border: none !important;
-        border-radius: 30px !important;
-        font-weight: 700 !important;
-        font-size: 0.95rem !important;
-        padding: 0.65rem 2rem !important;
-        box-shadow: 0 4px 15px rgba(37, 99, 235, 0.2) !important;
-        transition: all 0.2s ease !important;
-        display: inline-flex !important;
-        align-items: center !important;
-        justify-content: center !important;
-        gap: 0.5rem !important;
-        width: 100% !important;
-        margin: 0 auto !important;
-    }
-    .custom-action-btn div.stButton > button:hover {
-        background: #1D4ED8 !important;
-        transform: translateY(-1px) !important;
-        box-shadow: 0 6px 20px rgba(37, 99, 235, 0.3) !important;
-    }
-    .custom-action-btn div.stButton {
-        text-align: center !important;
-        width: 100% !important;
-    }
-    
-    /* Feedback list and comments styles */
-    .comment-card {
-        background-color: #FFFFFF;
-        padding: 1.5rem;
-        border-radius: 16px;
-        margin-bottom: 1.25rem;
-        border: 1px solid #E5E7EB;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.01);
-    }
-    .comment-header {
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
-        margin-bottom: 0.75rem;
-    }
-    .comment-avatar {
-        width: 40px;
-        height: 40px;
-        border-radius: 50%;
-        background-color: #EFF6FF;
-        color: #2563EB;
-        font-weight: bold;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 1rem;
-        border: 2px solid #DBEAFE;
-    }
-    .comment-meta {
-        display: flex;
-        flex-direction: column;
-    }
-    .comment-user {
-        font-weight: 700;
-        color: #1F2937;
-        font-size: 0.95rem;
-    }
-    .comment-date {
-        font-size: 0.8rem;
-        color: #64748B;
-    }
-    .comment-body {
-        color: #334155;
-        font-size: 0.95rem;
-        line-height: 1.5;
-        margin: 0 0 1rem 0;
-    }
-    .comment-actions {
-        display: flex;
-        gap: 1.25rem;
-        border-top: 1px solid #F1F5F9;
-        padding-top: 0.75rem;
-        margin-top: 0.75rem;
-    }
-    .action-link {
-        display: flex;
-        align-items: center;
-        gap: 0.35rem;
-        font-size: 0.82rem;
-        color: #64748B;
-        text-decoration: none;
-        cursor: pointer;
-        font-weight: 500;
-    }
-    .action-link:hover {
-        color: #2563EB;
-    }
-    
-    /* Status Badges Styling */
-    .status-badge {
-        padding: 6px 12px !important;
-        border-radius: 20px !important;
-        font-weight: 700 !important;
-        font-size: 0.85rem !important;
-        display: inline-block !important;
-        text-transform: uppercase !important;
-        border: 1px solid transparent !important;
-    }
-    .status-approved {
-        background-color: #D1FAE5 !important;
-        color: #065F46 !important;
-        border-color: #A7F3D0 !important;
-    }
-    .status-pending {
-        background-color: #FEF3C7 !important;
-        color: #92400E !important;
-        border-color: #FDE68A !important;
-    }
-    .status-rejected {
-        background-color: #FEE2E2 !important;
-        color: #991B1B !important;
-        border-color: #FCA5A5 !important;
-    }
-    
-    
-    /* ─────────────────────────────────────────────────────────────────────────
-       Responsive Mobile and Tablet Layout Fixes
-       ───────────────────────────────────────────────────────────────────────── */
-    @media (max-width: 768px) {
-        /* General Streamlit Container padding override */
-        div[data-testid="stAppViewBlockContainer"] {
-            padding: 1rem 0.75rem !important;
-        }
-        
-        /* Navbar collapse style */
-        .custom-navbar {
-            height: auto !important;
-            flex-direction: column !important;
-            align-items: center !important;
-            border-radius: 16px !important;
-            padding: 1rem !important;
-            gap: 0.75rem !important;
-            margin-bottom: 1.5rem !important;
-            position: relative !important;
-            top: 0 !important;
-        }
-        .custom-navbar div {
-            flex-wrap: wrap !important;
-            justify-content: center !important;
-            gap: 0.5rem !important;
-            width: 100% !important;
-        }
-        .custom-navbar button {
-            padding: 0.4rem 0.8rem !important;
-            font-size: 0.8rem !important;
-        }
-        .custom-navbar .nav-register-btn {
-            padding: 0.4rem 1rem !important;
-            font-size: 0.8rem !important;
-            width: 100% !important;
-            text-align: center !important;
-        }
-        
-        /* Hero Banner Stack */
-        .hero-section {
-            padding: 2rem 1rem !important;
-            margin-top: 0px !important;
-            border-radius: 16px !important;
-            margin-bottom: 1.5rem !important;
-        }
-        .hero-content {
-            flex-direction: column !important;
-            text-align: center !important;
-            gap: 1.5rem !important;
-        }
-        .hero-title {
-            font-size: 2rem !important;
-            text-align: center !important;
-            line-height: 1.2 !important;
-        }
-        .hero-subtitle {
-            font-size: 0.95rem !important;
-            text-align: center !important;
-            max-width: 100% !important;
-            margin-left: auto !important;
-            margin-right: auto !important;
-            margin-bottom: 1.5rem !important;
-        }
-        .hero-badges {
-            justify-content: center !important;
-            gap: 0.5rem !important;
-        }
-        .hero-right {
-            display: none !important; /* Hide decorative scanning HUD on mobile to save vertical space */
-        }
-        
-        /* Premium cards scaling */
-        .saas-card {
-            padding: 1.25rem !important;
-            border-radius: 16px !important;
-        }
-    }
-</style>""", unsafe_allow_html=True)
+    apply_global_theme()
 
 def render_navbar():
     active_home = "active" if st.session_state.current_page == "Home / Scanner" else ""
@@ -1331,34 +501,6 @@ def render_hero():
                 <p class="hero-subtitle">
                     {subtitle}
                 </p>
-                <div class="hero-badges">
-                    <span class="hero-badge"><span class="hero-badge-check">✓</span> AI Powered</span>
-                    <span class="hero-badge"><span class="hero-badge-check">✓</span> Real-time</span>
-                    <span class="hero-badge"><span class="hero-badge-check">✓</span> Secure</span>
-                    <span class="hero-badge"><span class="hero-badge-check">✓</span> Cloud Ready</span>
-                </div>
-                <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
-                    <a href="?nav=Home%20%2F%20Scanner&action=start" target="_self" style="text-decoration: none;">
-                        <button style="background-color: #FFFFFF; color: #2563EB; border: none; font-weight: 700; font-size: 0.95rem; padding: 0.8rem 1.8rem; border-radius: 30px; cursor: pointer; box-shadow: 0 4px 15px rgba(255,255,255,0.15);">Start Attendance</button>
-                    </a>
-                    <a href="?nav=Feature" target="_self" style="text-decoration: none;">
-                        <button style="background-color: rgba(255,255,255,0.1); color: #FFFFFF; border: 1px solid rgba(255,255,255,0.25); font-weight: 600; font-size: 0.95rem; padding: 0.8rem 1.8rem; border-radius: 30px; cursor: pointer;">Learn More</button>
-                    </a>
-                </div>
-            </div>
-            <div class="hero-right">
-                <div class="face-scan-container">
-                    <div class="scanning-ring"></div>
-                    <div class="face-mesh">
-                        <svg width="170" height="170" viewBox="0 0 24 24" fill="none" stroke="#60A5FA" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 15px rgba(96, 165, 250, 0.6));">
-                            <path d="M18 10a6 6 0 0 0-12 0v2c0 3.75 3 6.75 6 7.2v2.8h-2v2h4v-2h-2v-2.8c3-.45 6-3.45 6-7.2v-2z"/>
-                            <circle cx="12" cy="10" r="3" stroke="#60A5FA" stroke-width="1.5"/>
-                            <line x1="6" y1="10" x2="18" y2="10" stroke-dasharray="2,2"/>
-                            <line x1="12" y1="4" x2="12" y2="17" stroke-dasharray="2,2"/>
-                        </svg>
-                        <div class="verification-checkmark">✓</div>
-                    </div>
-                </div>
             </div>
         </div>
     </div>
@@ -1707,7 +849,7 @@ if "user_id" not in st.session_state:
 if "approval_status" not in st.session_state:
     st.session_state.approval_status = None
 if "current_page" not in st.session_state:
-    st.session_state.current_page = "Home / Scanner"
+    st.session_state.current_page = "Welcome"
 if "registration_step" not in st.session_state:
     st.session_state.registration_step = "form"  # "form", "enroll", "password"
 if "captcha_data" not in st.session_state:
@@ -1798,18 +940,18 @@ def _go_dashboard():
 role_key = _role_key()
 
 if not _is_logged_in():
-    page_options = ["Home / Scanner", "Login", "Register"]
-    allowed_pages = page_options + ["Feature", "Techstack", "Comment", "Team", "Welcome"]
+    page_options = ["Welcome", "Login", "Register"]
+    allowed_pages = page_options + ["Feature", "Techstack", "Comment", "Team"]
 else:
     approval_status = str(st.session_state.get("approval_status") or "Approved").strip().lower()
 
     if approval_status not in ["approved", ""] or role_key == "guest":
         page_options = ["Guest Dashboard"]
         allowed_pages = ["Guest Dashboard", "Logout", "Feature", "Techstack", "Comment", "Team", "Welcome"]
-    elif role_key in ["admin", "super_admin", "superadmin"]:
-        page_options = ["Dashboard", "Manage Users", "Attendance", "Attendance Log", "Reports", "Profile"]
+    elif role_key in ["admin", "super_admin", "superadmin", "organization_admin", "organization_owner"]:
+        page_options = ["Dashboard", "Manage Users", "Attendance", "Attendance Log", "Reports", "Analytics", "Organization Dashboard", "Leaves", "Visitors", "Profile"]
         if role_key in ["super_admin", "superadmin"]:
-            page_options.append("Geo Location Settings")
+            page_options.append("Shifts")
         page_options.append("System Settings")
         allowed_pages = page_options + ["My Account", "Logout", "Admin Dashboard", "User Dashboard", "Feature", "Techstack", "Comment", "Team", "Welcome", "Update Face Profile"]
     elif role_key == "developer":
@@ -1817,17 +959,17 @@ else:
         allowed_pages = page_options + ["User Dashboard", "Logout", "Feature", "Techstack", "Comment", "Team", "Welcome", "Update Face Profile"]
 
     elif role_key == "premium_user":
-        page_options = ["Profile"]
-        allowed_pages = ["Profile", "Logout", "Feature", "Techstack", "Comment", "Team", "Welcome", "Update Face Profile"]
+        page_options = ["Profile", "Leaves", "Visitors"]
+        allowed_pages = ["Profile", "Leaves", "Logout", "Feature", "Techstack", "Comment", "Team", "Welcome", "Update Face Profile"]
 
     else:
-        page_options = ["Dashboard", "Home / Scanner", "Reports", "Profile"]
+        page_options = ["Dashboard", "Home / Scanner", "Reports", "Profile", "Leaves", "Visitors"]
         allowed_pages = page_options + ["User Dashboard", "Logout", "Feature", "Techstack", "Comment", "Team", "Welcome", "Update Face Profile"]
 
 protected_nav_pages = [
     "Dashboard", "User Dashboard", "Admin Dashboard", "Manage Users", "Attendance",
-    "Attendance Log", "Reports", "Profile", "My Account", "System Settings",
-    "Geo Location Settings", "Update Face Profile", "Guest Dashboard"
+    "Attendance Log", "Reports", "Analytics", "Profile", "My Account", "System Settings",
+    "Update Face Profile", "Guest Dashboard", "Organization Dashboard", "Leaves", "Shifts", "Visitors"
 ]
 
 if st.session_state.current_page in protected_nav_pages and not _is_logged_in():
@@ -1845,6 +987,28 @@ for p in page_options:
 
 if _is_logged_in():
     st.sidebar.write("---")
+    render_theme_toggle()
+    # Fetch alerts for bell
+    try:
+        unread_alerts = st.session_state.api.get_alerts(unread_only=True)
+        alert_count = len(unread_alerts)
+        if alert_count > 0:
+            if st.sidebar.button(f"🔔 Notifications ({alert_count})"):
+                st.session_state.show_notifications = not st.session_state.get("show_notifications", False)
+                st.rerun()
+        else:
+            st.sidebar.write("🔔 No new notifications")
+            
+        if st.session_state.get("show_notifications"):
+            st.sidebar.markdown("**Unread Notifications:**")
+            for alert in unread_alerts:
+                st.sidebar.info(f"**{alert['title']}**\n{alert['message']}")
+                if st.sidebar.button("Mark Read", key=f"read_{alert['id']}"):
+                    st.session_state.api.mark_alert_read(alert['id'])
+                    st.rerun()
+    except Exception:
+        pass
+    st.sidebar.write("---")
     st.sidebar.write(f"Logged in as: **{st.session_state.get('username', '')}** ({st.session_state.get('user_role', 'User')})")
     if st.sidebar.button("Logout", key="btn_logout"):
         logout()
@@ -1854,7 +1018,7 @@ render_navbar()
 # Enforce authentication for restricted pages
 restricted_pages = [
     "User Dashboard", "Dashboard", "Admin Dashboard", "Manage Users", 
-    "Attendance Log", "System Settings", "Reports", "Geo Location Settings", 
+    "Attendance Log", "System Settings", "Reports", 
     "Profile", "Update Face Profile", "Admin"
 ]
 if st.session_state.current_page in restricted_pages and not _is_logged_in():
@@ -1879,13 +1043,17 @@ elif st.session_state.current_page == "Comment":
     render_comments_section()
 elif st.session_state.current_page == "Team":
     render_team_section()
-elif st.session_state.current_page == "Geo Location Settings":
-    if str(st.session_state.get("user_role", "")).lower() == "super_admin":
-        render_geo_settings()
-    else:
-        st.error("❌ Access Denied: Only Super Admin can access Geo Location Settings.")
+
 elif st.session_state.current_page == "Reports":
     render_reports_page()
+elif st.session_state.current_page == "Analytics":
+    st.warning("Analytics Dashboard is under construction")
+elif st.session_state.current_page == "Organization Dashboard":
+    render_organization_dashboard(api)
+elif st.session_state.current_page == "Welcome":
+    render_hero()
+    st.info("Log in to access the Live Attendance Scanner.")
+    render_stats_section()
 elif st.session_state.current_page in ["Home / Scanner", "Attendance"]:
     render_hero()
     render_scanner_section(api)
@@ -1914,10 +1082,22 @@ elif st.session_state.current_page == "Login":
     render_login_section(api)
 
 elif st.session_state.current_page == "Register":
-    if st.session_state.get("registration_step") == "face_enrollment":
+    step = st.session_state.get("registration_step", "info")
+    if step == "faces":
         render_face_enrollment_section(api)
+    elif step == "webauthn":
+        from modules.auth import render_webauthn_setup_section
+        render_webauthn_setup_section(api)
+    elif step == "password":
+        from modules.auth import render_password_setup_section
+        render_password_setup_section(api)
     else:
         render_register_section(api)
+
+elif st.session_state.current_page == "Shifts":
+    show_shifts_dashboard(api, st.session_state)
+elif st.session_state.current_page == "Leaves":
+    show_leave_dashboard(api, st.session_state)
 elif st.session_state.current_page == "User Dashboard":
     st.subheader("👤 User Attendance Dashboard")
     
@@ -2082,8 +1262,7 @@ elif st.session_state.current_page == "User Dashboard":
                     title="Daily Attendance Status (Current Month)"
                 )
                 fig.update_layout(
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    plot_bgcolor='rgba(0,0,0,0)',
+                    **get_plotly_theme(),
                     margin=dict(l=10, r=10, t=40, b=10),
                     height=280,
                     xaxis=dict(showgrid=False),
@@ -2318,11 +1497,6 @@ elif st.session_state.current_page in ["Admin Dashboard", "Dashboard"]:
                     except Exception as e:
                         st.error(f"Failed to save settings: {e}")
                 
-                if str(st.session_state.get("user_role", "")).lower() == "super_admin":
-                    st.write("")
-                    if st.button("📍 Set Geo Location", use_container_width=True, key="btn_nav_geo_settings"):
-                        go_to_page("Geo Location Settings")
-                
                 st.markdown("---")
                 st.markdown("#### Current Settings")
                 def to_12h_format(t_str: str) -> str:
@@ -2334,6 +1508,107 @@ elif st.session_state.current_page in ["Admin Dashboard", "Dashboard"]:
                 st.markdown("*Late check-in:* After start time + grace period")
                 st.markdown("*Half-day:* Check-in after dynamic midpoint")
                 
+                # --- GEOLOCATION SETTINGS inside popover ---
+                if st.session_state.user_role in ["Super_Admin", "Developer"]:
+                    st.markdown("---")
+                    st.markdown("#### 📍 Geolocation Settings")
+                    st.write("Configure the allowed area for attendance marking.")
+                    
+                    try:
+                        geo_settings_list = api.get_geolocation_settings()
+                        if not isinstance(geo_settings_list, list):
+                            geo_settings_list = []
+                            
+                        # Default center (e.g. New York or first location)
+                        start_lat = geo_settings_list[0].get("latitude") if geo_settings_list and geo_settings_list[0].get("latitude") else 40.7128
+                        start_lon = geo_settings_list[0].get("longitude") if geo_settings_list and geo_settings_list[0].get("longitude") else -74.0060
+            
+                        m = folium.Map(location=[start_lat, start_lon], zoom_start=13)
+                        m.get_root().header.add_child(folium.Element("<style>.leaflet-control-attribution { opacity: 0.5 !important; font-size: 8px !important; background: transparent !important; pointer-events: none !important; }</style>"))
+                        
+                        # Plot all existing allowed zones
+                        for loc in geo_settings_list:
+                            if loc.get("latitude") is not None and loc.get("longitude") is not None:
+                                folium.Circle(
+                                    location=[loc["latitude"], loc["longitude"]],
+                                    radius=loc.get("radius", 50),
+                                    color="#4F46E5",
+                                    fill=True,
+                                    fill_color="#4F46E5",
+                                    tooltip=loc.get("name", "Allowed Zone")
+                                ).add_to(m)
+            
+                        m.add_child(folium.LatLngPopup())
+                        
+                        st.info("Click map to get coordinates for a new location.")
+                        map_data = st_folium(m, height=300, width=500, key="pop_map")
+                        
+                        clicked_lat = map_data["last_clicked"]["lat"] if map_data and map_data.get("last_clicked") else start_lat
+                        clicked_lon = map_data["last_clicked"]["lng"] if map_data and map_data.get("last_clicked") else start_lon
+                        
+                        # Manage locations
+                        loc_options = ["➕ Add New Location"] + [f"{loc['name']} (ID: {loc['id']})" for loc in geo_settings_list]
+                        selected_action = st.selectbox("Manage Locations", loc_options, key="geo_action")
+                        
+                        is_new = selected_action.startswith("➕")
+                        
+                        if is_new:
+                            sel_id = None
+                            sel_name = ""
+                            sel_lat = clicked_lat
+                            sel_lon = clicked_lon
+                            sel_rad = 50
+                        else:
+                            sel_id = int(selected_action.split("ID: ")[1].replace(")", ""))
+                            sel_loc = next((l for l in geo_settings_list if l["id"] == sel_id), None)
+                            sel_name = sel_loc["name"] if sel_loc else ""
+                            sel_lat = sel_loc["latitude"] if sel_loc and sel_loc.get("latitude") else clicked_lat
+                            sel_lon = sel_loc["longitude"] if sel_loc and sel_loc.get("longitude") else clicked_lon
+                            sel_rad = sel_loc["radius"] if sel_loc else 50
+            
+                        from streamlit_geolocation import streamlit_geolocation
+                        loc = streamlit_geolocation()
+                        if loc and loc.get('latitude'):
+                            sel_lat = loc['latitude']
+                            sel_lon = loc['longitude']
+                            
+                            # Update session state to force the number_inputs to refresh
+                            curr_loc_str = f"{sel_lat},{sel_lon}"
+                            if st.session_state.get("last_detected_loc") != curr_loc_str:
+                                st.session_state["last_detected_loc"] = curr_loc_str
+                                st.session_state["pop_lat"] = float(sel_lat)
+                                st.session_state["pop_lon"] = float(sel_lon)
+
+                        form_name = st.text_input("Location Name", value=sel_name, key="pop_name")
+                        form_lat = st.number_input("Latitude", value=float(sel_lat), format="%.6f", key="pop_lat")
+                        form_lon = st.number_input("Longitude", value=float(sel_lon), format="%.6f", key="pop_lon")
+                        form_radius = st.number_input("Allowed Radius (meters)", min_value=10, max_value=5000, value=int(sel_rad), key="pop_rad")
+                        
+                        col_save, col_del = st.columns(2)
+                        with col_save:
+                            if st.button("💾 Save Location", type="primary", use_container_width=True, key="btn_save_geo_settings"):
+                                if not form_name:
+                                    st.error("Name is required.")
+                                else:
+                                    try:
+                                        api.update_geolocation_settings(form_name, form_lat, form_lon, form_radius, sel_id)
+                                        st.success("✅ Geolocation saved!")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"❌ Failed to save: {e}")
+                                        
+                        with col_del:
+                            if not is_new:
+                                if st.button("🗑️ Delete Location", use_container_width=True, key="btn_del_geo"):
+                                    try:
+                                        api.delete_geolocation_setting(sel_id)
+                                        st.success("✅ Geolocation deleted!")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"❌ Failed to delete: {e}")
+                    except Exception as e:
+                        st.error(f"Failed to load geolocation settings: {e}")
+
                 st.markdown("---")
                 st.markdown("#### 🔄 Model Utilities")
                 if st.button("🔄 Rebuild Face Embeddings Cache", use_container_width=True, key="btn_rebuild_face_cache"):
@@ -2644,6 +1919,44 @@ elif st.session_state.current_page in ["Admin Dashboard", "Dashboard"]:
 
                 except Exception as e:
                     st.error(f"Failed to load correction messages: {e}")
+                
+                # --- GEOLOCATION VIOLATIONS ---
+                st.markdown("<hr style='margin: 3rem 0; border-color: #E2E8F0;'/>", unsafe_allow_html=True)
+                st.markdown("### 📍 Location Violations")
+                st.markdown("<p style='color: #64748B;'>View failed attendance attempts due to geolocation restrictions.</p>", unsafe_allow_html=True)
+                
+                try:
+                    violation_resp = api.get_location_violations()
+                    violations = violation_resp.get("logs", [])
+                    
+                    if not violations:
+                        st.success("No location violations found.")
+                    else:
+                        # Table view
+                        v_df = pd.DataFrame(violations)
+                        if not v_df.empty:
+                            v_df = v_df.rename(columns={"user_name": "Name", "reason": "Reason", "timestamp": "Time"})
+                            st.dataframe(v_df[["Name", "Reason", "Time"]], use_container_width=True)
+                        
+                        # Map view
+                        st.markdown("#### Violation Map")
+                        # Center on first violation
+                        first_v = next((v for v in violations if v.get("latitude") and v.get("longitude")), None)
+                        if first_v:
+                            vm = folium.Map(location=[first_v["latitude"], first_v["longitude"]], zoom_start=12)
+                            vm.get_root().header.add_child(folium.Element("<style>.leaflet-control-attribution { opacity: 0.5 !important; font-size: 8px !important; background: transparent !important; pointer-events: none !important; }</style>"))
+                            
+                            for v in violations:
+                                if v.get("latitude") and v.get("longitude"):
+                                    folium.Marker(
+                                        location=[v["latitude"], v["longitude"]],
+                                        popup=f"{v.get('user_name', 'Unknown')}: {v.get('timestamp')}",
+                                        icon=folium.Icon(color="red", icon="info-sign")
+                                    ).add_to(vm)
+                            
+                            st_folium(vm, height=400, width=700)
+                except Exception as e:
+                    st.error(f"Failed to load location violations: {e}")
                                             
         elif selected_tab == "🛡️ Admin Attendance":
             st.markdown("### 🛡️ Administrator Attendance Console")
@@ -3111,6 +2424,65 @@ elif st.session_state.current_page == "System Settings":
                     st.error(f"❌ Failed to save: {e}")
     except Exception as e:
         st.error(f"Failed to load settings: {e}")
+
+    # --- GEOLOCATION SETTINGS ---
+    if st.session_state.user_role in ["Super_Admin", "Developer"]:
+        st.markdown("<hr style='margin: 2rem 0; border-color: #E2E8F0;'/>", unsafe_allow_html=True)
+        st.subheader("📍 Geolocation Settings")
+        st.markdown("<p style='color: #64748B;'>Configure the allowed area for attendance marking.</p>", unsafe_allow_html=True)
+        
+        try:
+            geo_settings = api.get_geolocation_settings()
+            # Default to some central coordinate if not set
+            start_lat = geo_settings.get("latitude") or 40.7128
+            start_lon = geo_settings.get("longitude") or -74.0060
+            radius_val = geo_settings.get("radius") or 50
+
+            m = folium.Map(location=[start_lat, start_lon], zoom_start=15)
+            m.get_root().header.add_child(folium.Element("<style>.leaflet-control-attribution { opacity: 0.5 !important; font-size: 8px !important; background: transparent !important; pointer-events: none !important; }</style>"))
+            
+            # Show current allowed zone if set
+            if geo_settings.get("latitude") is not None:
+                folium.Circle(
+                    location=[geo_settings["latitude"], geo_settings["longitude"]],
+                    radius=radius_val,
+                    color="#4F46E5",
+                    fill=True,
+                    fill_color="#4F46E5"
+                ).add_to(m)
+
+            m.add_child(folium.LatLngPopup())
+            
+            st.info("Click anywhere on the map to select a new center point.")
+            map_data = st_folium(m, height=400, width=700)
+            
+            with st.form("geolocation_settings_form"):
+                new_lat = start_lat
+                new_lon = start_lon
+                
+                if map_data.get("last_clicked"):
+                    new_lat = map_data["last_clicked"]["lat"]
+                    new_lon = map_data["last_clicked"]["lng"]
+
+                st.markdown("**Allowed Center Coordinates**")
+                g1, g2 = st.columns(2)
+                with g1:
+                    form_lat = st.number_input("Latitude", value=float(new_lat), format="%.6f")
+                with g2:
+                    form_lon = st.number_input("Longitude", value=float(new_lon), format="%.6f")
+                
+                form_radius = st.number_input("Allowed Radius (meters)", min_value=10, max_value=5000, value=int(radius_val))
+                
+                geo_save_btn = st.form_submit_button("💾 Save Geolocation Settings", type="primary")
+                if geo_save_btn:
+                    try:
+                        api.update_geolocation_settings(form_lat, form_lon, form_radius)
+                        st.success("✅ Geolocation settings updated successfully!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Failed to save geolocation: {e}")
+        except Exception as e:
+            st.error(f"Failed to load geolocation settings: {e}")
 
 # 7. USER PROFILE PAGE
 elif st.session_state.current_page in ["Profile", "My Account"]:

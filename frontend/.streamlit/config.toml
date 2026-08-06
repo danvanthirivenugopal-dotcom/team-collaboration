@@ -1,0 +1,4 @@
+[theme]
+# Removed base="dark" and hardcoded colors to allow our custom CSS Theme Engine to manage Light and Dark mode dynamically via session state.
+# We let Streamlit fall back to its system default or base="light", and we override with CSS variables in theme.py.
+font="sans serif"

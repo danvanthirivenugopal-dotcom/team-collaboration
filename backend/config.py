@@ -46,7 +46,7 @@ JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 if not JWT_SECRET_KEY:
     raise RuntimeError("JWT_SECRET_KEY is missing. Add it to your .env file.")
 
-if JWT_SECRET_KEY in ["change-this-secret-key", "secret", "123456", "password"]:
+if JWT_SECRET_KEY in ["change-this-secret-key", "secret", "123456", "password", "PUT_YOUR_REAL_RANDOM_SECRET_HERE"]:
     raise RuntimeError("Unsafe JWT_SECRET_KEY. Generate a strong random secret.")
 
 if len(JWT_SECRET_KEY) < 32:
@@ -68,4 +68,4 @@ ALLOWED_ORIGINS = [
 ]
 CAPTCHA_EXPIRE_MINUTES = 3
 
-COSINE_SIMILARITY_THRESHOLD = 0.45
+COSINE_SIMILARITY_THRESHOLD = 0.20

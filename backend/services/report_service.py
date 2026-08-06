@@ -5,6 +5,7 @@ from backend.database.db import get_db
 logger = logging.getLogger("faceai.report_service")
 
 def get_report_data(
+    organization_id: int,
     selected_date: str = None,
     selected_month: int = None,
     selected_year: int = None,
@@ -28,15 +29,12 @@ def get_report_data(
                 a.check_in_time,
                 a.check_out_time,
                 a.working_hours,
-                a.location_verified,
-                gf.location_name AS geo_fence_name,
                 a.status AS attendance_status
             FROM users u
             LEFT JOIN attendance a ON u.id = a.user_id
-            LEFT JOIN geo_fences gf ON a.geo_fence_id = gf.id
-            WHERE u.approval_status = 'Approved'
+            WHERE u.approval_status = 'Approved' AND u.organization_id = %s
         """
-        params = []
+        params = [organization_id]
         
         # Apply filters
         if selected_date:
@@ -87,8 +85,6 @@ def get_report_data(
             w_hours = row["working_hours"]
             w_hours_val = float(w_hours) if w_hours is not None else 0.0
             
-            loc_verified = bool(row["location_verified"]) if row["location_verified"] is not None else False
-            
             # If no attendance record exists, the status is Absent
             status_val = row["attendance_status"] if row["attendance_status"] else "Absent"
             
@@ -103,8 +99,6 @@ def get_report_data(
                 "check_in_time": check_in_str,
                 "check_out_time": check_out_str,
                 "working_hours": w_hours_val,
-                "location_verified": loc_verified,
-                "geo_fence_name": row["geo_fence_name"] or "N/A",
                 "attendance_status": status_val
             })
             

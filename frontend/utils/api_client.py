@@ -13,6 +13,7 @@ class FaceAiApiClient:
             or "http://127.0.0.1:8000"
         )
         self.token = None
+        self.tenant_id = None
 
     def check_health(self):
         try:
@@ -56,11 +57,17 @@ class FaceAiApiClient:
         
     def clear_token(self):
         self.token = None
+        self.tenant_id = None
         
+    def set_tenant_id(self, tenant_id: int):
+        self.tenant_id = tenant_id
+
     def _get_headers(self, is_multipart=False) -> dict:
         headers = {}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+        if self.tenant_id:
+            headers["X-Tenant-ID"] = str(self.tenant_id)
         return headers
 
     def _handle_error(self, r, default_msg: str):
@@ -86,71 +93,98 @@ class FaceAiApiClient:
 
     def login(self, email: str, password: str) -> dict:
         payload = {"email": email, "password": password}
-        r = requests.post(f"{self.base_url}/auth/login", json=payload)
+        r = requests.post(f"{self.base_url}/auth/login", json=payload, headers=self._get_headers())
         if r.status_code == 200:
             data = r.json()
             self.set_token(data["access_token"])
             return data
         self._handle_error(r, "Login failed.")
 
-    def register(self, data: dict) -> dict:
-        # Form-data post
-        r = requests.post(f"{self.base_url}/auth/register", data=data)
+    def start_company_registration(self, data: dict) -> dict:
+        r = requests.post(f"{self.base_url}/registration/company/start", json=data)
         if r.status_code == 200:
             return r.json()
-        self._handle_error(r, "Registration failed.")
+        self._handle_error(r, "Company Registration Step 1 failed.")
+
+    def start_employee_registration(self, data: dict) -> dict:
+        r = requests.post(f"{self.base_url}/registration/employee/start", json=data)
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Employee Registration Step 1 failed.")
+
+    def complete_company_face(self, session_token: str, images_dict: dict) -> dict:
+        files = {}
+        for pose, img_bytes in images_dict.items():
+            files[pose] = (f"{pose}.jpg", img_bytes, "image/jpeg")
+        data = {"session_token": session_token}
+        r = requests.post(f"{self.base_url}/registration/company/face", data=data, files=files)
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Company Registration Step 2 failed.")
+
+    def complete_employee_face(self, session_token: str, images_dict: dict) -> dict:
+        files = {}
+        for pose, img_bytes in images_dict.items():
+            files[pose] = (f"{pose}.jpg", img_bytes, "image/jpeg")
+        data = {"session_token": session_token}
+        r = requests.post(f"{self.base_url}/registration/employee/face", data=data, files=files)
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Employee Registration Step 2 failed.")
+
+    def complete_registration(self, session_token: str, password: str, confirm_password: str) -> dict:
+        payload = {
+            "session_token": session_token,
+            "password": password,
+            "confirm_password": confirm_password
+        }
+        r = requests.post(f"{self.base_url}/registration/complete", json=payload)
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to complete registration and set password.")
+
+    def get_public_organizations(self, search: str = "") -> list:
+        r = requests.get(f"{self.base_url}/registration/public/organizations", params={"search": search})
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to load organizations.")
+
+    def verify_pose(self, pose: str, image_bytes: bytes) -> dict:
+        files = {"image": ("frame.jpg", image_bytes, "image/jpeg")}
+        data = {"pose": pose}
+        r = requests.post(f"{self.base_url}/enroll/verify-pose", data=data, files=files, headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, f"Pose {pose} verification failed.")
 
     def upload_enrollment_pose(self, user_id: int, pose: str, image_bytes: bytes) -> dict:
         files = {"image": ("frame.jpg", image_bytes, "image/jpeg")}
-        data = {"user_id": str(user_id), "pose": pose}
-        r = requests.post(f"{self.base_url}/enroll/upload-pose", data=data, files=files)
+        data = {"pose": pose, "user_id": user_id}
+        r = requests.post(f"{self.base_url}/enroll/upload-pose", data=data, files=files, headers=self._get_headers())
         if r.status_code == 200:
             return r.json()
         self._handle_error(r, f"Pose {pose} upload failed.")
 
     def complete_enrollment(self, user_id: int) -> dict:
-        data = {"user_id": str(user_id)}
-        r = requests.post(f"{self.base_url}/enroll/complete", data=data)
+        data = {"user_id": user_id}
+        r = requests.post(f"{self.base_url}/enroll/complete", data=data, headers=self._get_headers())
         if r.status_code == 200:
             return r.json()
-        self._handle_error(r, "Failed to complete face enrollment.")
-
-    def get_location_status(self) -> dict:
-        try:
-            r = requests.get(f"{self.base_url}/attendance/location-status", timeout=3)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            pass
-        return {"location_required": False, "active_fences": 0}
-
-    def get_location_check(self, latitude: float = None, longitude: float = None) -> dict:
-        params = {}
-        if latitude is not None:
-            params["latitude"] = latitude
-        if longitude is not None:
-            params["longitude"] = longitude
-        try:
-            r = requests.get(f"{self.base_url}/attendance/location-check", params=params, timeout=3)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            pass
-        return {"ok": False, "message": "Could not verify location."}
+        self._handle_error(r, "Failed to complete face profile enrollment.")
 
     def scan_attendance_face(self, image_bytes: bytes, latitude: float = None, longitude: float = None) -> dict:
         files = {"image": ("scan.jpg", image_bytes, "image/jpeg")}
         data = {}
-        if latitude is not None:
+        if latitude is not None and longitude is not None:
             data["latitude"] = str(latitude)
-        if longitude is not None:
             data["longitude"] = str(longitude)
         try:
             r = requests.post(
                 f"{self.base_url}/attendance/scan",
                 files=files,
                 data=data,
-                timeout=15
+                timeout=15,
+                headers=self._get_headers()
             )
         except requests.exceptions.RequestException as e:
             raise Exception(f"Failed to contact attendance server: {e}")
@@ -159,13 +193,9 @@ class FaceAiApiClient:
             return r.json()
         self._handle_error(r, "Scan failed.")
 
-    def check_out(self, user_id: int, latitude: float = None, longitude: float = None) -> dict:
+    def check_out(self, user_id: int) -> dict:
         payload = {"user_id": user_id}
-        if latitude is not None:
-            payload["latitude"] = latitude
-        if longitude is not None:
-            payload["longitude"] = longitude
-        r = requests.post(f"{self.base_url}/attendance/check-out", json=payload)
+        r = requests.post(f"{self.base_url}/attendance/check-out", json=payload, headers=self._get_headers())
         if r.status_code == 200:
             return r.json()
         self._handle_error(r, "Checkout failed.")
@@ -183,25 +213,21 @@ class FaceAiApiClient:
         self._handle_error(r, "Password change failed.")
 
     def get_today_attendance(self, user_id: int) -> dict:
-        r = requests.get(f"{self.base_url}/attendance/today/{user_id}")
+        r = requests.get(f"{self.base_url}/attendance/today/{user_id}", headers=self._get_headers())
         if r.status_code == 200:
             return r.json()
         raise Exception("Failed to fetch today's attendance.")
 
-    def check_in(self, user_id: int, latitude: float = None, longitude: float = None) -> dict:
+    def check_in(self, user_id: int) -> dict:
         payload = {"user_id": user_id}
-        if latitude is not None:
-            payload["latitude"] = latitude
-        if longitude is not None:
-            payload["longitude"] = longitude
-        r = requests.post(f"{self.base_url}/attendance/check-in", json=payload)
+        r = requests.post(f"{self.base_url}/attendance/check-in", json=payload, headers=self._get_headers())
         if r.status_code == 200:
             return r.json()
         self._handle_error(r, "Check-in failed.")
 
     def get_scan_result(self, user_id: int) -> dict:
         payload = {"user_id": user_id}
-        r = requests.post(f"{self.base_url}/attendance/scan-result", json=payload)
+        r = requests.post(f"{self.base_url}/attendance/scan-result", json=payload, headers=self._get_headers())
         if r.status_code == 200:
             return r.json()
         self._handle_error(r, "Failed to get scan result.")
@@ -438,6 +464,54 @@ class FaceAiApiClient:
             return r.json()
         self._handle_error(r, "Failed to delete attendance settings.")
 
+    # --- GEOLOCATION SETTINGS ---
+    def get_geolocation_settings(self) -> list:
+        r = requests.get(
+            f"{self.base_url}/api/settings/geolocation",
+            headers=self._get_headers()
+        )
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to fetch geolocation settings.")
+
+    def update_geolocation_settings(self, name: str, latitude: float, longitude: float, radius: int, loc_id: int = None) -> dict:
+        payload = {
+            "name": name,
+            "latitude": latitude,
+            "longitude": longitude,
+            "radius": radius
+        }
+        if loc_id is not None:
+            payload["id"] = loc_id
+            
+        r = requests.post(
+            f"{self.base_url}/api/settings/geolocation",
+            json=payload,
+            headers=self._get_headers()
+        )
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to save geolocation settings.")
+
+    def delete_geolocation_setting(self, loc_id: int) -> dict:
+        r = requests.delete(
+            f"{self.base_url}/api/settings/geolocation/{loc_id}",
+            headers=self._get_headers()
+        )
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to delete geolocation setting.")
+
+    def get_location_violations(self) -> dict:
+        r = requests.get(
+            f"{self.base_url}/api/logs/location_violations",
+            headers=self._get_headers()
+        )
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to fetch location violations.")
+
+
     def rebuild_face_cache(self) -> dict:
         r = requests.post(f"{self.base_url}/admin/rebuild-face-cache", headers=self._get_headers())
         if r.status_code == 200:
@@ -471,45 +545,6 @@ class FaceAiApiClient:
         if r.status_code == 200:
             return r.json()
         raise Exception("Failed to fetch public stats metrics.")
-
-    # --- GEOFENCES ---
-    def get_geofences(self) -> list:
-        r = requests.get(f"{self.base_url}/admin/geofences", headers=self._get_headers())
-        if r.status_code == 200:
-            return r.json()
-        raise Exception("Failed to fetch geofences.")
-
-    def create_geofence(self, name: str, lat: float, lon: float, radius: float, is_active: bool) -> dict:
-        payload = {
-            "location_name": name,
-            "latitude": lat,
-            "longitude": lon,
-            "radius_meters": radius,
-            "is_active": is_active
-        }
-        r = requests.post(f"{self.base_url}/admin/geofences", json=payload, headers=self._get_headers())
-        if r.status_code == 200:
-            return r.json()
-        self._handle_error(r, "Failed to create geofence.")
-
-    def update_geofence(self, fence_id: int, name: str, lat: float, lon: float, radius: float, is_active: bool) -> dict:
-        payload = {
-            "location_name": name,
-            "latitude": lat,
-            "longitude": lon,
-            "radius_meters": radius,
-            "is_active": is_active
-        }
-        r = requests.put(f"{self.base_url}/admin/geofences/{fence_id}", json=payload, headers=self._get_headers())
-        if r.status_code == 200:
-            return r.json()
-        self._handle_error(r, "Failed to update geofence.")
-
-    def delete_geofence(self, fence_id: int) -> dict:
-        r = requests.delete(f"{self.base_url}/admin/geofences/{fence_id}", headers=self._get_headers())
-        if r.status_code == 200:
-            return r.json()
-        self._handle_error(r, "Failed to delete geofence.")
 
     # --- REPORTS ---
   
@@ -567,7 +602,7 @@ class FaceAiApiClient:
 
     def webauthn_register_challenge(self, user_id: int) -> dict:
         """Request a WebAuthn registration challenge from the server."""
-        r = requests.post(f"{self.base_url}/webauthn/register/challenge", json={"user_id": user_id})
+        r = requests.post(f"{self.base_url}/webauthn/register/challenge", json={"user_id": user_id}, headers=self._get_headers())
         if r.status_code == 200:
             return r.json()
         self._handle_error(r, "Failed to get registration challenge.")
@@ -580,14 +615,14 @@ class FaceAiApiClient:
             "public_key": public_key,
             "transports": transports or [],
         }
-        r = requests.post(f"{self.base_url}/webauthn/register/complete", json=payload)
+        r = requests.post(f"{self.base_url}/webauthn/register/complete", json=payload, headers=self._get_headers())
         if r.status_code == 200:
             return r.json()
         self._handle_error(r, "Failed to complete fingerprint registration.")
 
     def webauthn_status(self, user_id: int) -> dict:
         """Check if a user has a registered WebAuthn credential."""
-        r = requests.get(f"{self.base_url}/webauthn/status/{user_id}")
+        r = requests.get(f"{self.base_url}/webauthn/status/{user_id}", headers=self._get_headers())
         if r.status_code == 200:
             return r.json()
         return {"has_credential": False, "credentials": []}
@@ -598,9 +633,7 @@ class FaceAiApiClient:
         client_data_json: str,
         authenticator_data: str,
         signature: str,
-        user_handle: str = None,
-        latitude: float = None,
-        longitude: float = None,
+        user_handle: str = None
     ) -> dict:
         """Submit WebAuthn assertion response and mark fingerprint attendance."""
         payload = {
@@ -611,11 +644,7 @@ class FaceAiApiClient:
         }
         if user_handle:
             payload["user_handle"] = user_handle
-        if latitude is not None:
-            payload["latitude"] = latitude
-        if longitude is not None:
-            payload["longitude"] = longitude
-        r = requests.post(f"{self.base_url}/webauthn/authenticate", json=payload)
+        r = requests.post(f"{self.base_url}/webauthn/authenticate", json=payload, headers=self._get_headers())
         if r.status_code == 200:
             return r.json()
         self._handle_error(r, "Fingerprint authentication failed.")
@@ -630,3 +659,120 @@ class FaceAiApiClient:
 
 
 
+
+    # --- SHIFT API ---
+    def create_shift(self, name: str, start_time: str, end_time: str, grace_period_minutes: int) -> dict:
+        payload = {
+            "name": name,
+            "start_time": start_time,
+            "end_time": end_time,
+            "grace_period_minutes": grace_period_minutes
+        }
+        r = requests.post(f"{self.base_url}/admin/shifts", json=payload, headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to create shift")
+
+    def get_shifts(self) -> list:
+        r = requests.get(f"{self.base_url}/admin/shifts", headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to get shifts")
+
+    def assign_shift(self, user_id: int, shift_id: int) -> dict:
+        payload = {"user_id": user_id, "shift_id": shift_id}
+        r = requests.post(f"{self.base_url}/admin/shifts/assign", json=payload, headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to assign shift")
+
+    # --- LEAVE API ---
+    def request_leave(self, leave_type_id: int, start_date: str, end_date: str, reason: str) -> dict:
+        payload = {
+            "leave_type_id": leave_type_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "reason": reason
+        }
+        r = requests.post(f"{self.base_url}/leave/request", json=payload, headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to submit leave request")
+
+    def get_my_leave_requests(self) -> list:
+        r = requests.get(f"{self.base_url}/leave/my-requests", headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to get my leave requests")
+
+    def get_pending_leaves(self) -> list:
+        r = requests.get(f"{self.base_url}/admin/leaves/pending", headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to get pending leave requests")
+
+    def review_leave_request(self, request_id: int, status: str) -> dict:
+        payload = {"status": status}
+        r = requests.post(f"{self.base_url}/admin/leaves/{request_id}/review", json=payload, headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to review leave request")
+
+    # ==============================================================================
+    # VISITOR MANAGEMENT (Phase 9)
+    # ==============================================================================
+    def register_visitor(self, payload: dict) -> dict:
+        r = requests.post(f"{self.base_url}/visitors/register", json=payload, headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to register visitor.")
+
+    def get_visitors(self, status: str = None) -> list:
+        url = f"{self.base_url}/visitors"
+        if status:
+            url += f"?status={status}"
+        r = requests.get(url, headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to fetch visitors.")
+
+    def review_visit(self, visit_id: int, status: str) -> dict:
+        payload = {"status": status}
+        r = requests.post(f"{self.base_url}/visitors/{visit_id}/review", json=payload, headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to review visit.")
+
+    def check_in_visitor(self, qr_token: str) -> dict:
+        payload = {"qr_token": qr_token}
+        r = requests.post(f"{self.base_url}/visitors/check-in", json=payload, headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to check in visitor.")
+
+    # ==============================================================================
+    # ALERTS (Phase 10)
+    # ==============================================================================
+    def get_alerts(self, unread_only: bool = False) -> list:
+        url = f"{self.base_url}/alerts"
+        if unread_only:
+            url += "?unread_only=true"
+        r = requests.get(url, headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to fetch alerts.")
+
+    def mark_alert_read(self, alert_id: int) -> dict:
+        r = requests.post(f"{self.base_url}/alerts/{alert_id}/read", headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to mark alert as read.")
+
+    # ==============================================================================
+    # ANALYTICS (Phase 11)
+    # ==============================================================================
+    def get_analytics_dashboard(self, days: int = 30) -> dict:
+        r = requests.get(f"{self.base_url}/analytics/dashboard?days={days}", headers=self._get_headers())
+        if r.status_code == 200:
+            return r.json()
+        self._handle_error(r, "Failed to fetch analytics dashboard.")
