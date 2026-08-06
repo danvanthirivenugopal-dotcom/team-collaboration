@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from backend import config
 from backend.database.db import get_db, init_db
-from backend.services import (captcha_service,auth_service,audit_service,attendance_service,report_service,pdf_service,webauthn_service,shift_service,leave_service)
+from backend.services import (captcha_service,auth_service,audit_service,attendance_service,report_service,pdf_service,webauthn_service)
 from backend.face_recognition import yolo_detector, recognizer, mediapipe_pose
 import numpy as np
 import cv2
@@ -777,8 +777,7 @@ def complete_enrollment(user_id: int = Form(...)):
     if new_embedding is None:
         raise HTTPException(status_code=400, detail="Could not extract face embedding. Please retake the front photo.")
 
-    # Use an extremely high threshold so identical twins (or testing with the same face) can be registered
-    DUPLICATE_FACE_THRESHOLD = 0.999
+    DUPLICATE_FACE_THRESHOLD = max(config.COSINE_SIMILARITY_THRESHOLD, 0.40)
 
     try:
         with get_db() as conn:
@@ -1012,10 +1011,7 @@ def login(payload: LoginPayload):
 @app.post("/attendance/scan", dependencies=[limit_scan_per_min])
 async def scan_face(
     background_tasks: BackgroundTasks,
-    image: UploadFile = File(...),
-    latitude: Optional[float] = Form(None),
-    longitude: Optional[float] = Form(None),
-    organization_id: int = Depends(get_current_organization)
+    image: UploadFile = File(...)
 ):
     """
     Perform face scanning for attendance check-in.
@@ -1060,16 +1056,16 @@ async def scan_face(
         logger.warning(f"Object detection failed during scan: {e}")
     
     # ===== FACE RECOGNITION =====
-    predictions = recognizer.predict_multiple_faces(img, organization_id)
+    predictions = recognizer.predict_multiple_faces(img)
 
-    # Reject multiple faces
-    if predictions and len(predictions) > 1:
-        logger.info("Scan: Multiple faces detected.")
-        return {
-            "status": "multiple_faces",
-            "message": "Multiple faces detected. Only one person can mark attendance at a time.",
-            "detection_warnings": detection_warnings
-        }
+    # Attendance scanner should process only ONE main face.
+    # This prevents duplicate / multiple face marking from the same camera frame.
+    if len(predictions) > 1:
+        predictions = sorted(
+            predictions,
+            key=lambda p: (p["bbox"][2] - p["bbox"][0]) * (p["bbox"][3] - p["bbox"][1]),
+            reverse=True
+        )[:1]
     
     # Fallback to YOLOv8 single face detection if InsightFace returned nothing
     if not predictions:
@@ -1158,10 +1154,7 @@ async def scan_face(
         try:
             res = attendance_service.handle_biometric_attendance(
                 user_id=user["id"],
-                method="face",
-                latitude=latitude,
-                longitude=longitude,
-                organization_id=organization_id
+                method="face"
             )
             
             # Map the precise status correctly for the frontend response list
@@ -1244,8 +1237,7 @@ def check_in_endpoint(payload: CheckInPayload, organization_id: int = Depends(ge
             }
             
         res = attendance_service.mark_check_in(
-            user_id=payload.user_id,
-            organization_id=organization_id
+            user_id=payload.user_id
         )
         return {
             "success": True,
@@ -1261,8 +1253,7 @@ def check_out(payload: CheckOutPayload, organization_id: int = Depends(get_curre
     """Record checkout timestamp for today."""
     try:
         res = attendance_service.mark_check_out(
-            user_id=payload.user_id,
-            organization_id=organization_id
+            user_id=payload.user_id
         )
         return {
             "success": True,
@@ -1362,8 +1353,7 @@ def webauthn_authenticate(payload: WebAuthnAuthPayload, organization_id: int = D
     # Step 2: Run unified biometric attendance engine
     att_result = attendance_service.handle_biometric_attendance(
         user_id=user_id,
-        method="fingerprint",
-        organization_id=organization_id
+        method="fingerprint"
     )
 
     status = att_result["status"]

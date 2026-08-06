@@ -12,8 +12,6 @@ from io import BytesIO
 from pathlib import Path
 import logging
 import os
-import folium
-from streamlit_folium import st_folium
 
 from pages.reports import render_reports_page
 # from pages.organization import render_organization_dashboard
@@ -948,10 +946,8 @@ else:
     if approval_status not in ["approved", ""] or role_key == "guest":
         page_options = ["Guest Dashboard"]
         allowed_pages = ["Guest Dashboard", "Logout", "Feature", "Techstack", "Comment", "Team", "Welcome"]
-    elif role_key in ["admin", "super_admin", "superadmin", "organization_admin", "organization_owner"]:
-        page_options = ["Dashboard", "Manage Users", "Attendance", "Attendance Log", "Reports", "Analytics", "Organization Dashboard", "Leaves", "Visitors", "Profile"]
-        if role_key in ["super_admin", "superadmin"]:
-            page_options.append("Shifts")
+    elif role_key in ["admin", "super_admin", "superadmin"]:
+        page_options = ["Dashboard", "Manage Users", "Attendance", "Attendance Log", "Reports", "Profile"]
         page_options.append("System Settings")
         allowed_pages = page_options + ["My Account", "Logout", "Admin Dashboard", "User Dashboard", "Feature", "Techstack", "Comment", "Team", "Welcome", "Update Face Profile"]
     elif role_key == "developer":
@@ -968,8 +964,8 @@ else:
 
 protected_nav_pages = [
     "Dashboard", "User Dashboard", "Admin Dashboard", "Manage Users", "Attendance",
-    "Attendance Log", "Reports", "Analytics", "Profile", "My Account", "System Settings",
-    "Update Face Profile", "Guest Dashboard", "Organization Dashboard", "Leaves", "Shifts", "Visitors"
+    "Attendance Log", "Reports", "Profile", "My Account", "System Settings",
+    "Update Face Profile", "Guest Dashboard"
 ]
 
 if st.session_state.current_page in protected_nav_pages and not _is_logged_in():
@@ -1497,6 +1493,7 @@ elif st.session_state.current_page in ["Admin Dashboard", "Dashboard"]:
                     except Exception as e:
                         st.error(f"Failed to save settings: {e}")
                 
+
                 st.markdown("---")
                 st.markdown("#### Current Settings")
                 def to_12h_format(t_str: str) -> str:

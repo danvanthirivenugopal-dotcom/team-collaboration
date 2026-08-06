@@ -170,14 +170,11 @@ class FaceAiApiClient:
         r = requests.post(f"{self.base_url}/enroll/complete", data=data, headers=self._get_headers())
         if r.status_code == 200:
             return r.json()
-        self._handle_error(r, "Failed to complete face profile enrollment.")
+        self._handle_error(r, "Failed to complete face enrollment.")
 
-    def scan_attendance_face(self, image_bytes: bytes, latitude: float = None, longitude: float = None) -> dict:
+    def scan_attendance_face(self, image_bytes: bytes) -> dict:
         files = {"image": ("scan.jpg", image_bytes, "image/jpeg")}
         data = {}
-        if latitude is not None and longitude is not None:
-            data["latitude"] = str(latitude)
-            data["longitude"] = str(longitude)
         try:
             r = requests.post(
                 f"{self.base_url}/attendance/scan",
@@ -195,7 +192,7 @@ class FaceAiApiClient:
 
     def check_out(self, user_id: int) -> dict:
         payload = {"user_id": user_id}
-        r = requests.post(f"{self.base_url}/attendance/check-out", json=payload, headers=self._get_headers())
+        r = requests.post(f"{self.base_url}/attendance/check-out", json=payload)
         if r.status_code == 200:
             return r.json()
         self._handle_error(r, "Checkout failed.")
@@ -220,7 +217,7 @@ class FaceAiApiClient:
 
     def check_in(self, user_id: int) -> dict:
         payload = {"user_id": user_id}
-        r = requests.post(f"{self.base_url}/attendance/check-in", json=payload, headers=self._get_headers())
+        r = requests.post(f"{self.base_url}/attendance/check-in", json=payload)
         if r.status_code == 200:
             return r.json()
         self._handle_error(r, "Check-in failed.")
@@ -644,7 +641,7 @@ class FaceAiApiClient:
         }
         if user_handle:
             payload["user_handle"] = user_handle
-        r = requests.post(f"{self.base_url}/webauthn/authenticate", json=payload, headers=self._get_headers())
+        r = requests.post(f"{self.base_url}/webauthn/authenticate", json=payload)
         if r.status_code == 200:
             return r.json()
         self._handle_error(r, "Fingerprint authentication failed.")

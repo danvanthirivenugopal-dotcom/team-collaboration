@@ -32,7 +32,7 @@ def get_report_data(
                 a.status AS attendance_status
             FROM users u
             LEFT JOIN attendance a ON u.id = a.user_id
-            WHERE u.approval_status = 'Approved' AND u.organization_id = %s
+            WHERE u.approval_status = 'Approved'
         """
         params = [organization_id]
         

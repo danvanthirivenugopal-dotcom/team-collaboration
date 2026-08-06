@@ -6,6 +6,105 @@ from io import BytesIO
 from pathlib import Path
 import streamlit.components.v1 as components
 
+def draw_face_overlay(frame, x1, y1, x2, y2, name, user_id, status_det):
+    # Select color based on status (BGR format)
+    if status_det == "recognized" or status_det == "checked_in":
+        box_color = (255, 255, 0)    # Cyan to match requested design
+        status_text = "MARKED"
+    elif status_det in ["already_marked", "ask_leave", "ask_checkout", "already_completed"]:
+        box_color = (255, 255, 0)    # Cyan for already marked/leaving
+        status_text = "ALREADY MARKED"
+    elif status_det == "not_approved":
+        box_color = (0, 165, 255)    # Orange for pending approval
+        status_text = "PENDING"
+    elif status_det == "location_error":
+        box_color = (0, 165, 255)    # Orange/Yellow for location error
+        status_text = "LOCATION ERROR"
+    elif status_det == "method_mismatch":
+        box_color = (0, 0, 255)      # Red for method mismatch
+        status_text = "METHOD ERROR"
+    elif status_det == "error":
+        box_color = (0, 0, 255)      # Red for general error
+        status_text = "ERROR"
+    else:
+        box_color = (0, 0, 255)      # Red for guest/guest
+        status_text = "NEW USER"
+
+    # Draw bounding box around face
+    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+    
+    # Format labels - Name + Status on line 1, ID on line 2
+    # For guest/guest/unknown faces, override name display
+    display_name = name if (name and status_det not in ("guest", "unknown", None)) else "UNREGISTERED"
+    label_line1 = f"{display_name.upper()} ({status_text})"
+    # Handle None user_id
+    student_id = user_id if user_id is not None else None
+    label_line2 = f"ID: STU{100 + student_id}" if student_id is not None else "Unregistered Face"
+        
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale_line1 = 0.55
+    scale_line2 = 0.45
+    thick_line1 = 2
+    thick_line2 = 1
+    
+    (w_line1, h_line1), _ = cv2.getTextSize(label_line1, font, scale_line1, thick_line1)
+    (w_line2, h_line2), _ = cv2.getTextSize(label_line2, font, scale_line2, thick_line2)
+    label_w = max(w_line1, w_line2) + 16
+    label_h = h_line1 + h_line2 + 20
+        
+    # Place label ABOVE the bounding box
+    lx1 = x1 + (x2 - x1 - label_w) // 2
+    ly1 = y1 - label_h - 6
+    
+    # Fallback to drawing BELOW if it goes above the frame boundary
+    if ly1 < 5:
+        ly1 = y2 + 6
+        
+    lx2 = lx1 + label_w
+    ly2 = ly1 + label_h
+    
+    # Clip coordinates to frame size
+    fh, fw, _ = frame.shape
+    lx1 = max(0, min(lx1, fw - 1))
+    lx2 = max(0, min(lx2, fw - 1))
+    ly1 = max(0, min(ly1, fh - 1))
+    ly2 = max(0, min(ly2, fh - 1))
+    
+    # Solid background drawing
+    if lx2 > lx1 and ly2 > ly1:
+        # Draw solid background matching the box color
+        cv2.rectangle(frame, (lx1, ly1), (lx2, ly2), box_color, -1)
+        
+        # Draw text on frame (white text)
+        ty1 = ly1 + h_line1 + 8
+        cv2.putText(frame, label_line1, (lx1 + 8, ty1), font, scale_line1, (255, 255, 255), thick_line1, cv2.LINE_AA)
+        
+        # Draw text on frame - Line 2 (ID)
+        ty2 = ty1 + h_line2 + 8
+        cv2.putText(frame, label_line2, (lx1 + 8, ty2), font, scale_line2, (255, 255, 255), thick_line2, cv2.LINE_AA)
+
+# Process HTML navigation query parameters
+# Navigation query parameters are handled only in frontend/app.py.
+
+
+def detect_local_faces(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    face_cascade = cv2.CascadeClassifier(cascade_path)
+
+    faces = face_cascade.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(80, 80)
+    )
+
+    results = []
+    for (x, y, w, h) in faces:
+        results.append([int(x), int(y), int(x + w), int(y + h)])
+
+    return results
+
 
 def render_scanner_section(api):
     if "cooldowns" not in st.session_state:
@@ -24,58 +123,6 @@ def render_scanner_section(api):
         st.session_state.status_message = None
     if "webauthn_key" not in st.session_state:
         st.session_state.webauthn_key = 0
-
-    if "user_lat" not in st.session_state or "user_lon" not in st.session_state:
-        user_lat_q = st.query_params.get("user_lat")
-        user_lon_q = st.query_params.get("user_lon")
-        
-        geo_error_q = st.query_params.get("geo_error")
-        if user_lat_q and user_lon_q:
-            st.session_state.user_lat = float(user_lat_q)
-            st.session_state.user_lon = float(user_lon_q)
-            st.query_params.pop("user_lat", None)
-            st.query_params.pop("user_lon", None)
-            st.query_params.pop("geo_error", None)
-        elif geo_error_q:
-            st.session_state.user_lat = None
-            st.session_state.user_lon = None
-            st.error(f"Browser Location Error: {geo_error_q}. Please ensure you are on localhost or HTTPS, and have granted location permissions.")
-            st.query_params.pop("geo_error", None)
-        else:
-            st.session_state.user_lat = None
-            st.session_state.user_lon = None
-            st.components.v1.html("""
-            <script>
-            if (navigator.geolocation) {
-                navigator.geolocation.getCurrentPosition(
-                    (position) => {
-                        const urlParams = new URLSearchParams(window.parent.location.search);
-                        if (!urlParams.has('user_lat')) {
-                            urlParams.set('user_lat', position.coords.latitude);
-                            urlParams.set('user_lon', position.coords.longitude);
-                            window.parent.location.search = urlParams.toString();
-                        }
-                    },
-                    (error) => {
-                        let errMsg = error.message;
-                        if (error.code === error.PERMISSION_DENIED) errMsg = "Permission Denied";
-                        else if (error.code === error.POSITION_UNAVAILABLE) errMsg = "Position Unavailable";
-                        else if (error.code === error.TIMEOUT) errMsg = "Timeout";
-                        
-                        const urlParams = new URLSearchParams(window.parent.location.search);
-                        if (!urlParams.has('geo_error')) {
-                            urlParams.set('geo_error', errMsg);
-                            window.parent.location.search = urlParams.toString();
-                        }
-                    }
-                );
-            } else {
-                const urlParams = new URLSearchParams(window.parent.location.search);
-                urlParams.set('geo_error', 'Geolocation API not supported by browser (or blocked due to HTTP/iframe rules)');
-                window.parent.location.search = urlParams.toString();
-            }
-            </script>
-            """, height=0, width=0)
 
 
     # Handle a pending WebAuthn result from JS first thing
@@ -287,7 +334,7 @@ def render_scanner_section(api):
                     try:
                         res = api.check_out(user_id=user_id)
                         if res and res.get("status") == "ok":
-                            st.session_state.status_message = ("success", f"{user_name}, checkout time successfully marked.")
+                            st.session_state.status_message = ("success", f"✅ Check-Out successful! Have a great day.")
                         else:
                             st.session_state.status_message = ("error", f"❌ Failed to mark check-out for {user_name}")
                         # Stop scanning during checkout API call
@@ -336,6 +383,20 @@ def render_scanner_section(api):
                     icon_b64 = base64.b64encode(f.read()).decode()
             except Exception:
                 icon_b64 = ""
+
+            st.markdown(f"""
+            <div style="text-align: center;">
+                <h2 style='font-family: "Inter", sans-serif; font-weight: 800; color: #1F2937; margin-bottom: 0.5rem;'>Live Attendance Scanner</h2>
+                <p style="color: #64748B; font-size: 0.95rem; margin-bottom: 2rem;">Start camera scanning to mark attendance instantly.</p>
+            </div>
+            <div class="scan-circle-wrapper">
+                <div class="scan-circle-ring-1"></div>
+                <div class="scan-circle-ring-2"></div>
+                <div class="scan-circle-center" style="background: none; border: none; box-shadow: none;">
+                    <img src="data:image/png;base64,{icon_b64}" width="150" height="150" style="border-radius: 50%; border: 4px solid #DBEAFE; object-fit: cover;">
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
             st.markdown("<div class='custom-action-btn'>", unsafe_allow_html=True)
             if st.button(
@@ -819,3 +880,258 @@ async function startFingerprintAttendance() {{
                     st.session_state.camera = None
                 st.rerun()
             st.markdown("</div>", unsafe_allow_html=True)
+
+            if "scan_stats" not in st.session_state:
+                st.session_state.scan_stats = {"total_scans": 0, "recognized": 0}
+            
+            acc = 0.0
+            if st.session_state.scan_stats["total_scans"] > 0:
+                acc = (st.session_state.scan_stats["recognized"] / st.session_state.scan_stats["total_scans"]) * 100
+                
+            st.markdown(f"""
+            <div style="display: flex; justify-content: space-between; margin-top: 2rem;">
+                <div style="background: white; border-radius: 12px; padding: 1.5rem; text-align: center; width: 23%; box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
+                    <h3 style="color: #60A5FA; font-size: 2rem; margin: 0; font-family: 'Inter', sans-serif; font-weight: 800;">{st.session_state.scan_stats['total_scans']}</h3>
+                    <p style="color: #64748B; font-size: 0.8rem; margin: 0.5rem 0 0 0; font-weight: 600;">Total Scans</p>
+                </div>
+                <div style="background: white; border-radius: 12px; padding: 1.5rem; text-align: center; width: 23%; box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
+                    <h3 style="color: #818CF8; font-size: 2rem; margin: 0; font-family: 'Inter', sans-serif; font-weight: 800;">{st.session_state.scan_stats['recognized']}</h3>
+                    <p style="color: #64748B; font-size: 0.8rem; margin: 0.5rem 0 0 0; font-weight: 600;">Recognized</p>
+                </div>
+                <div style="background: white; border-radius: 12px; padding: 1.5rem; text-align: center; width: 23%; box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
+                    <h3 style="color: #A78BFA; font-size: 2rem; margin: 0; font-family: 'Inter', sans-serif; font-weight: 800;">{acc:.1f}%</h3>
+                    <p style="color: #64748B; font-size: 0.8rem; margin: 0.5rem 0 0 0; font-weight: 600;">Accuracy</p>
+                </div>
+                <div style="background: white; border-radius: 12px; padding: 1.5rem; text-align: center; width: 23%; box-shadow: 0 4px 6px rgba(0,0,0,0.05);">
+                    <h3 style="color: #93C5FD; font-size: 2rem; margin: 0; font-family: 'Inter', sans-serif; font-weight: 800;">54.5%</h3>
+                    <p style="color: #64748B; font-size: 0.8rem; margin: 0.5rem 0 0 0; font-weight: 600;">Attendance Rate</p>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if "camera" not in st.session_state or st.session_state.camera is None or not st.session_state.camera.isOpened():
+                # Don't start camera if checkout modal is active
+                if not st.session_state.get("show_leave_confirmation"):
+                    st.session_state.camera = cv2.VideoCapture(0)
+                else:
+                    st.session_state.camera = None
+                
+            cap = st.session_state.camera
+
+        if cap is not None:
+            if not cap.isOpened():
+                status_placeholder.error("Cannot open system web-camera. Make sure it is connected.")
+            else:
+                last_call_time = 0.0
+                scan_line_y = 0
+                scan_dir = 1
+            
+                if "active_scanner_detections" not in st.session_state:
+                    st.session_state.active_scanner_detections = []
+                
+                # Continuous scanner loop
+                try:
+                    while st.session_state.get("scanning", False):
+                        # Break immediately if checkout modal is needed
+                        if st.session_state.get("show_leave_confirmation"):
+                            break
+                            
+                        ret, frame = cap.read()
+                        if not ret:
+                            time.sleep(0.05)
+                            continue
+                        
+                        frame = cv2.flip(frame, 1)
+                        clean_frame = frame.copy()
+                        h, w, _ = frame.shape
+                    
+                        # Draw real-time bounding boxes
+                        if st.session_state.get("active_scanner_detections"):
+                            for det in st.session_state.active_scanner_detections:
+                                bbox = det.get("bbox")
+                                if bbox and len(bbox) == 4:
+                                    x1, y1, x2, y2 = bbox
+                                    name = det.get("name", "guest")
+                                    status_det = det.get("status", "guest")
+                                    user_id = det.get("user_id")
+                                    draw_face_overlay(frame, x1, y1, x2, y2, name, user_id, status_det)
+                        else:
+                            # Local real-time face detection while backend recognition is processing
+                            local_faces = detect_local_faces(clean_frame)
+
+                            if local_faces:
+                                # Show largest detected face like image 2
+                                local_faces = sorted(
+                                    local_faces,
+                                    key=lambda b: (b[2] - b[0]) * (b[3] - b[1]),
+                                    reverse=True
+                                )
+
+                                x1, y1, x2, y2 = local_faces[0]
+                                draw_face_overlay(
+                                    frame,
+                                    x1, y1, x2, y2,
+                                    "Detecting",
+                                    None,
+                                    "recognized"
+                                )
+                            else:
+                                # Draw default guides only when no face detected
+                                box_w, box_h = int(w * 0.45), int(h * 0.55)
+                                bx1, by1 = int((w - box_w) / 2), int((h - box_h) / 2)
+                                bx2, by2 = bx1 + box_w, by1 + box_h
+
+                                cv2.rectangle(frame, (bx1, by1), (bx2, by2), (255, 255, 255), 2)
+                                cv2.putText(
+                                    frame,
+                                    "ALIGN FACE HERE",
+                                    (bx1 + 10, by1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.6,
+                                    (255, 255, 255),
+                                    2
+                                )
+                        
+                        # Scanning line animation
+                        scan_line_y += 8 * scan_dir
+                        box_h_guide = int(h * 0.55)
+                        if scan_line_y >= box_h_guide or scan_line_y <= 0:
+                            scan_dir *= -1
+                        by1_guide = int((h - box_h_guide)/2)
+                        bx1_guide = int((w - int(w * 0.45))/2)
+                        bx2_guide = bx1_guide + int(w * 0.45)
+                        line_pos = by1_guide + scan_line_y
+                        cv2.line(frame, (bx1_guide + 5, line_pos), (bx2_guide - 5, line_pos), (255, 255, 255), 2)
+                    
+                        frame_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB")
+                    
+                        # Trigger API scan validation every 800ms
+                        current_time = time.time()
+                        if current_time - last_call_time >= 0.8:
+                            last_call_time = current_time
+                        
+                            _, img_encoded = cv2.imencode('.jpg', clean_frame)
+                            image_bytes = img_encoded.tobytes()
+                        
+                            try:
+                                res = api.scan_attendance_face(image_bytes)
+                                status = res.get("status")
+                            
+                                if status in ["checked_in", "already_completed", "ask_checkout", "not_approved"]:
+                                    res["results"] = [{"status": status, "name": res.get("name"), "user_id": res.get("user_id"), "bbox": res.get("bbox", [])}]
+                                    status = "recognized_multiple"
+                                
+                                if res and status == "recognized_multiple":
+                                    items = res.get("results", [])
+                                    st.session_state.active_scanner_detections = items
+                                    
+                                    # Update stats
+                                    st.session_state.scan_stats["total_scans"] += len(items)
+                                    st.session_state.scan_stats["recognized"] += sum(1 for it in items if it.get("status") not in ["guest", "unknown", "error"])
+                                
+                                    need_rerun = False
+                                    messages = []
+                                    has_guest = False
+                                    
+                                    for item in items:
+                                        item_status = item.get("status")
+                                        user_id = item.get("user_id")
+                                        
+                                        if item_status in ["guest", "unknown"]:
+                                            has_guest = True
+                                            continue
+                                            
+                                        if not user_id:
+                                            continue
+                                        
+                                        # --- ask_checkout: MUST bypass 30s cooldown, but use its own 15s cooldown ---
+                                        if item_status == "ask_checkout":
+                                            last_ask_time = st.session_state.cooldowns.get(f"ask_{user_id}", 0)
+                                            if current_time - last_ask_time >= 15.0:
+                                                if not st.session_state.get("show_leave_confirmation"):
+                                                    st.session_state.pending_checkout_user_id = user_id
+                                                    st.session_state.pending_checkout_user_name = item["name"]
+                                                    st.session_state.pending_checkout_user_role = item.get("role", "user")
+                                                    st.session_state.pending_attendance_method = "face"
+                                                    st.session_state.scanned_user = item
+                                                    st.session_state.pending_checkout_warning = item.get("warning")
+                                                    st.session_state.show_leave_confirmation = True
+                                                st.session_state.scanning = False
+                                                # Remove any stale cooldown so Leave card shows immediately
+                                                st.session_state.cooldowns.pop(f"ask_{user_id}", None)
+                                                if "camera" in st.session_state and st.session_state.camera is not None:
+                                                    st.session_state.camera.release()
+                                                    st.session_state.camera = None
+                                                print("ASK_CHECKOUT triggered for:", user_id, item["name"])
+                                                need_rerun = True
+                                            continue  # skip cooldown logic below for ask_checkout
+                                        
+                                        # Check cooldown (30 seconds) — only for non-ask_checkout statuses
+                                        last_action_time = st.session_state.cooldowns.get(user_id, 0)
+                                        if current_time - last_action_time < 30.0:
+                                            continue
+                                        
+                                        if item_status == "checked_in":
+                                            st.session_state.cooldowns[user_id] = current_time
+                                            messages.append(("success", f"✅ Attendance Marked! Welcome, {item['name']}."))
+                                        
+                                        elif item_status == "already_completed":
+                                            st.session_state.cooldowns[user_id] = current_time
+                                            messages.append(("info", f"ℹ️ Attendance already completed today."))
+
+
+                                        elif item_status == "not_approved":
+                                            st.session_state.cooldowns[user_id] = current_time
+                                            messages.append(("warning", f"⏳ {item['name']}, your account is pending admin approval."))
+
+                                        elif item_status == "error":
+                                            st.session_state.cooldowns[user_id] = current_time
+                                            err_msg = item.get("message") or "Failed to log attendance."
+                                            messages.append(("warning", f"❌ {item.get('name', 'User')}: {err_msg}"))
+
+                                        elif item_status == "method_mismatch":
+                                            st.session_state.cooldowns[user_id] = current_time
+                                            messages.append(("warning", f"❌ {item['name']}'s attendance is marked with your fingerprint"))
+                                    
+                                    if has_guest:
+                                        last_guest_time = st.session_state.cooldowns.get("guest_face", 0)
+                                        if current_time - last_guest_time >= 3.0:
+                                            st.session_state.cooldowns["guest_face"] = current_time
+                                            messages.append(("info", "👤 Guest detected. Face not registered — attendance cannot be marked."))
+                                            
+                                    if messages:
+                                        with status_placeholder.container():
+                                            for msg_type, msg_text in messages:
+                                                if msg_type == "success":
+                                                    st.success(msg_text)
+                                                elif msg_type == "info":
+                                                    st.info(msg_text)
+                                                elif msg_type == "warning":
+                                                    st.warning(msg_text)
+                                                elif msg_type == "error":
+                                                    st.error(msg_text)
+                                                    
+                                    if need_rerun:
+                                        st.rerun()
+                                    
+                                elif status == "guest":
+                                    st.session_state.active_scanner_detections = res.get("results", [])
+                                    status_placeholder.info("👤 Guest Face Detected — Not Registered")
+                                    
+                                elif status in ["not_aligned", "no_face", "unknown"]:
+                                    st.session_state.active_scanner_detections = []
+                                
+                            except Exception as e:
+                                last_error_time = st.session_state.get("cooldowns", {}).get("scan_api_error", 0)
+                                if current_time - last_error_time >= 5.0:
+                                    st.session_state.cooldowns["scan_api_error"] = current_time
+                                    status_placeholder.error(f"Scan failed: {e}")
+                            
+                        time.sleep(0.03)
+                finally:
+                    if not st.session_state.get("scanning", False):
+                        if "camera" in st.session_state and st.session_state.camera is not None:
+                            st.session_state.camera.release()
+                            st.session_state.camera = None
+        st.markdown('</div>', unsafe_allow_html=True)
+

@@ -136,12 +136,7 @@ def get_attendance_settings(organization_id: int = 1) -> dict:
 
 def mark_check_in(
     user_id: int,
-    latitude: float = None,
-    longitude: float = None,
-    fence_id: int = None,
-    fence_name: str = None,
-    similarity: float = 1.0,
-    organization_id: int = 1
+    similarity: float = 1.0
 ) -> dict:
     current_date = datetime.now().date()
     now_dt = datetime.now()
@@ -163,15 +158,9 @@ def mark_check_in(
                     image_path,
                     confidence,
                     half_day,
-                    checkin_latitude,
-                    checkin_longitude,
-                    location_verified,
-                    geo_fence_id,
-                    attendance_status,
-                    organization_id
+                    attendance_status
                 )
-                VALUES (%s, %s, %s, %s, NULL, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE status = status
+                VALUES (%s, %s, %s, %s, NULL, %s, %s, %s)
                 """,
                 (
                     user_id,
@@ -180,12 +169,7 @@ def mark_check_in(
                     attendance_status,
                     float(similarity),
                     is_half_day,
-                    latitude,
-                    longitude,
-                    True,
-                    fence_id,
-                    attendance_status,
-                    organization_id
+                    attendance_status
                 )
             )
 
@@ -196,7 +180,7 @@ def mark_check_in(
                 """,
                 (
                     user_id,
-                    f"Check-In ({attendance_status}) from {fence_name or 'Allowed Location'}"
+                    f"Check-In ({attendance_status}) from Allowed Location"
                 )
             )
 
@@ -208,32 +192,19 @@ def mark_check_in(
 
 
 def mark_check_out(
-    user_id: int,
-    latitude: float = None,
-    longitude: float = None,
-    organization_id: int = 1
+    user_id: int
 ) -> dict:
-    from backend.services import geofence_service, audit_service
+    from backend.services import audit_service
 
     current_date = datetime.now().date()
     now_dt = datetime.now()
     now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    loc_ok, fence_id, fence_name = geofence_service.verify_location(latitude, longitude)
-
-    if not loc_ok:
-        audit_service.log_audit_action(
-            None,
-            f"Geo-fence warning: Checkout recorded outside allowed geofence for user ID {user_id}.",
-            user_id
-        )
-        fence_name = "Outside Allowed Location"
-
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, check_in_time, status
+                SELECT attendance_id, check_in_time, status
                 FROM attendance
                 WHERE user_id = %s
                   AND attendance_date = %s
@@ -261,21 +232,17 @@ def mark_check_out(
                 """
                 UPDATE attendance
                 SET check_out_time = %s,
-                    checkout_latitude = %s,
-                    checkout_longitude = %s,
                     working_hours = %s,
                     status = %s,
                     attendance_status = %s
-                WHERE id = %s
+                WHERE attendance_id = %s
                 """,
                 (
                     now_str,
-                    latitude,
-                    longitude,
                     hours,
                     final_status,
                     final_status,
-                    record["id"]
+                    record["attendance_id"]
                 )
             )
 
@@ -286,7 +253,7 @@ def mark_check_out(
                 """,
                 (
                     user_id,
-                    f"Check-Out (Hours worked: {hours:.2f}, Status: {final_status}) from {fence_name or 'Allowed Location'}"
+                    f"Check-Out (Hours worked: {hours:.2f}, Status: {final_status}) from Allowed Location"
                 )
             )
 
@@ -302,6 +269,7 @@ def handle_face_scan_result(user_id: int, organization_id: int = 1) -> str:
     record = get_today_attendance(user_id, organization_id)
 
     if not record:
+        mark_check_in(user_id=user_id, similarity=1.0)
         return "CHECK_IN_MARKED"
 
     if record["check_out_time"] is None:
@@ -312,13 +280,8 @@ def handle_face_scan_result(user_id: int, organization_id: int = 1) -> str:
 
 def handle_biometric_attendance(
     user_id: int,
-    method: str,
-    latitude: float = None,
-    longitude: float = None,
-    organization_id: int = 1
+    method: str
 ) -> dict:
-    from backend.services import geofence_service
-
     with get_db() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -329,33 +292,7 @@ def handle_biometric_attendance(
 
     user_name = user_row["name"] if user_row else "User"
 
-    loc_ok, fence_id, fence_name = geofence_service.verify_location(latitude, longitude)
-
-    if not loc_ok:
-        if geofence_service.is_location_required() and (latitude is None or longitude is None):
-            message = "Location access is required. Please enable GPS/location in your browser and reload the page."
-        else:
-            loc_details = geofence_service.get_location_details(latitude, longitude)
-            dist_m = loc_details.get("distance_m")
-            nearest_fence = loc_details.get("fence_name", "office")
-
-            if dist_m is not None:
-                message = (
-                    f"You are {dist_m:.0f}m away from '{nearest_fence}'. "
-                    "Please move closer to the office and try again."
-                )
-            else:
-                message = "You are not in the allowed location. Please move closer to the office and try again."
-
-        return {
-            "status": "location_error",
-            "message": message,
-            "user_id": user_id,
-            "method": method,
-            "user_name": user_name
-        }
-
-    record = get_today_attendance(user_id, organization_id)
+    record = get_today_attendance(user_id)
 
     if not record:
         settings = get_attendance_settings(organization_id)
@@ -370,7 +307,7 @@ def handle_biometric_attendance(
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT id
+                    SELECT attendance_id
                     FROM attendance
                     WHERE user_id = %s AND attendance_date = %s
                     LIMIT 1
@@ -398,14 +335,10 @@ def handle_biometric_attendance(
                             image_path,
                             confidence,
                             half_day,
-                            checkin_latitude,
-                            checkin_longitude,
-                            location_verified,
-                            geo_fence_id,
                             attendance_status,
                             attendance_method
                         )
-                        VALUES (%s, %s, %s, %s, NULL, 1.0, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, NULL, 1.0, %s, %s, %s)
                         """,
                         (
                             user_id,
@@ -413,10 +346,6 @@ def handle_biometric_attendance(
                             now_str,
                             attendance_status,
                             is_half_day,
-                            latitude,
-                            longitude,
-                            True,
-                            fence_id,
                             attendance_status,
                             method
                         )
@@ -429,7 +358,7 @@ def handle_biometric_attendance(
                         """,
                         (
                             user_id,
-                            f"Check-In via {method} ({attendance_status}) from {fence_name or 'Allowed Location'}"
+                            f"Check-In via {method} ({attendance_status}) from Allowed Location"
                         )
                     )
 

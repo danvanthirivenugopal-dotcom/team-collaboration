@@ -14,7 +14,7 @@ logger = logging.getLogger("faceai.recognizer")
 # ─────────────────────────────────────────────────────────────────────────────
 DEEPFACE_MODEL    = "ArcFace"    # Primary model: 512-dim ArcFace embeddings
 DEEPFACE_FALLBACK = "Facenet512" # Fallback if primary model download fails
-DEEPFACE_DETECTOR = "ssd" # Face detector: highly robust for multi-face without OOM
+DEEPFACE_DETECTOR = "opencv"      # Face detector: ssd is fast and highly robust compared to opencv
 DEEPFACE_ALIGN    = True         # Face alignment improves accuracy
 
 # Active model (will be set to fallback if primary weights fail)
@@ -505,8 +505,7 @@ def predict_face(color_img: np.ndarray, organization_id: int = 1) -> tuple[int, 
                 cursor.execute("""
                     SELECT id, name 
                     FROM users 
-                    WHERE organization_id = %s
-                """, (organization_id,))
+                """)
                 users = cursor.fetchall()
     except Exception as e:
         logger.error(f"Failed to query approved users: {e}")
@@ -580,6 +579,36 @@ def _filter_duplicate_face_boxes(face_results: list[tuple[np.ndarray, list[int]]
     return filtered
 
 
+    filtered = []
+
+    for emb, box in face_results:
+        x1, y1, x2, y2 = box
+        area = max(1, (x2 - x1) * (y2 - y1))
+
+        duplicate = False
+
+        for _, kept_box in filtered:
+            kx1, ky1, kx2, ky2 = kept_box
+
+            ix1 = max(x1, kx1)
+            iy1 = max(y1, ky1)
+            ix2 = min(x2, kx2)
+            iy2 = min(y2, ky2)
+
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            kept_area = max(1, (kx2 - kx1) * (ky2 - ky1))
+            iou = inter / float(area + kept_area - inter)
+
+            if iou > 0.45:
+                duplicate = True
+                break
+
+        if not duplicate:
+            filtered.append((emb, box))
+
+    return filtered
+
+
 def predict_multiple_faces(color_img: np.ndarray, organization_id: int = 1) -> list[dict]:
     """
     Predict identities for ALL faces detected in the image.
@@ -599,8 +628,7 @@ def predict_multiple_faces(color_img: np.ndarray, organization_id: int = 1) -> l
                 cursor.execute("""
                     SELECT id, name 
                     FROM users 
-                    WHERE organization_id = %s
-                """, (organization_id,))
+                """)
                 users = cursor.fetchall()
     except Exception as e:
         logger.error(f"Failed to query approved users for multi-face prediction: {e}")
